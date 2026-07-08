@@ -134,18 +134,39 @@ postgres=# \q
 
 **Вариант 2: Supabase**
 
+⚠️ **ВАЖНО про IPv6 / Network is unreachable:**
+
+На бесплатном тарифе Supabase **прямое подключение** (Direct connection, эндпоинт `db.<project-ref>.supabase.co:5432`) доступно **ТОЛЬКО по IPv6**. Если на вашей машине нет исходящего IPv6-маршрута (большинство обычных сетей и VPS), вы получите ошибку:
+
+```
+OSError: [Errno 101] Network is unreachable
+```
+
+**✅ РЕШЕНИЕ: Используйте Session Pooler (доступен по IPv4)**
+
 1. Зарегистрируйтесь на [supabase.com](https://supabase.com)
-2. Создайте новый проект
+2. Создайте новый проект (выберите регион ближе к вашему хосту)
 3. Перейдите в **Project Settings → Database → Connection string**
-4. Используйте **Connection pooling** (режим Transaction для pgBouncer)
-5. Приведите строку к формату проекта:
-   ```env
-   # Исходная строка от Supabase (pooler):
-   # postgresql://postgres.xxxxx:[YOUR-PASSWORD]@aws-0-eu-central-1.pooler.supabase.com:5432/postgres
-   
-   # Формат для проекта (добавьте +asyncpg и ?sslmode=require):
-   DATABASE_URL=postgresql+asyncpg://postgres.xxxxx:password@aws-0-eu-central-1.pooler.supabase.com:5432/postgres?sslmode=require
+4. **ОБЯЗАТЕЛЬНО** выберите вкладку **«Session pooler»** (НЕ «Direct connection»!)
+5. Скопируйте строку подключения — она имеет вид:
    ```
+   postgresql://postgres.<project-ref>:[YOUR-PASSWORD]@aws-0-<region>.pooler.supabase.com:5432/postgres
+   ```
+   
+   **Обратите внимание:** пользователь в pooler-строке имеет вид `postgres.<project-ref>` (с точкой), а не просто `postgres`.
+
+6. Приведите строку к формату проекта (добавьте `+asyncpg` и `?sslmode=require`):
+   ```env
+   DATABASE_URL=postgresql+asyncpg://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres?sslmode=require
+   ```
+
+7. Готово! Код автоматически обработает SSL и настроит совместимость с pooler (`statement_cache_size=0` уже выставлен).
+
+**Пример полной строки:**
+```env
+# Для проекта с ref "abcdefghijklmnopqrst" в регионе eu-central-1:
+DATABASE_URL=postgresql+asyncpg://postgres.abcdefghijklmnopqrst:your_password@aws-0-eu-central-1.pooler.supabase.com:5432/postgres?sslmode=require
+```
 
 #### Важные детали
 

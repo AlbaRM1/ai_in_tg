@@ -141,10 +141,53 @@ async def init_db() -> None:
     новых колонок (совместимость с существующими БД).
     Поддерживает PostgreSQL и SQLite.
     """
-    async with engine.begin() as conn:
-        # Создаём таблицы (если их нет)
-        await conn.run_sync(Base.metadata.create_all)
-        logger.info("create_all выполнен")
+    try:
+        async with engine.begin() as conn:
+            # Создаём таблицы (если их нет)
+            await conn.run_sync(Base.metadata.create_all)
+            logger.info("create_all выполнен")
+    except OSError as e:
+        # errno 101 = ENETUNREACH (Network is unreachable)
+        # errno 111 = ECONNREFUSED (Connection refused)
+        # errno 113 = EHOSTUNREACH (No route to host)
+        if e.errno in (101, 111, 113):
+            logger.error(
+                "❌ Не удалось подключиться к БД (Network is unreachable / Connection refused). "
+                "\n\n"
+                "🔍 ДИАГНОЗ: Если вы используете Supabase на бесплатном тарифе — прямое подключение "
+                "(db.<project-ref>.supabase.co) доступно ТОЛЬКО по IPv6. "
+                "На вашей машине отсутствует исходящий IPv6-маршрут → Network is unreachable.\n"
+                "\n"
+                "✅ РЕШЕНИЕ: Используйте Session Pooler (доступен по IPv4):\n"
+                "   1. Откройте Supabase Dashboard → Project Settings → Database → Connection string\n"
+                "   2. Выберите вкладку «Session pooler» (НЕ «Direct connection»)\n"
+                "   3. Скопируйте строку подключения (эндпоинт aws-0-<region>.pooler.supabase.com, порт 5432)\n"
+                "   4. Пользователь в pooler-строке имеет вид postgres.<project-ref> (с точкой)\n"
+                "   5. Схема должна быть postgresql+asyncpg:// и в конце ?sslmode=require\n"
+                "\n"
+                "📝 Пример итоговой строки:\n"
+                "   DATABASE_URL=postgresql+asyncpg://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres?sslmode=require\n"
+                "\n"
+                "ℹ️  statement_cache_size=0 уже выставлен в коде (совместимость с pooler), "
+                "ничего дополнительно настраивать не надо."
+            )
+        raise
+    except Exception as e:
+        # Ловим другие сетевые ошибки от asyncpg/SQLAlchemy
+        import_error_msg = str(e).lower()
+        if any(keyword in import_error_msg for keyword in [
+            "connection", "connect", "network", "unreachable",
+            "refused", "timeout", "ssl", "host"
+        ]):
+            logger.error(
+                f"❌ Ошибка подключения к БД: {e}\n"
+                "\n"
+                "🔍 Если вы используете Supabase на бесплатном тарифе и видите 'Network is unreachable' — "
+                "используйте Session Pooler (IPv4) вместо прямого подключения (IPv6-only).\n"
+                "Инструкция: Supabase Dashboard → Project Settings → Database → Connection string → "
+                "вкладка «Session pooler»."
+            )
+        raise
     
     # Идемпотентное добавление новых колонок в chat_sessions
     # PostgreSQL: используем IF NOT EXISTS
