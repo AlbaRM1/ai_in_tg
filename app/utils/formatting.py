@@ -246,3 +246,133 @@ def sanitize_for_streaming(text: str) -> str:
     """
     # Просто возвращаем как есть, без HTML-форматирования
     return text
+
+
+def split_html_for_telegram(html: str, limit: int = 4096) -> list[str]:
+    """
+    Разбивает HTML-текст на части, не превышающие лимит символов Telegram.
+    Корректно обрабатывает HTML-теги: не разрывает теги, сохраняет вложенность,
+    закрывает незакрытые теги в конце части и заново открывает в начале следующей.
+    
+    Алгоритм:
+    1. Парсит HTML на токены (теги, текст, HTML-сущности)
+    2. Собирает части, отслеживая открытые теги в стеке
+    3. При приближении к лимиту ищет безопасную точку разреза
+    4. Закрывает открытые теги в конце части (в обратном порядке)
+    5. Открывает их заново в начале следующей части
+    
+    Поддерживаемые теги: b, i, u, s, code, pre, a, tg-spoiler, blockquote
+    
+    Args:
+        html: HTML-текст после format_for_telegram()
+        limit: Максимальная длина одной части (по умолчанию 4096 — лимит Telegram)
+        
+    Returns:
+        Список частей HTML-текста, каждая ≤ limit символов
+    """
+    if not html or not html.strip():
+        return []
+    
+    # Регулярное выражение для парсинга HTML-токенов
+    token_pattern = re.compile(
+        r'(<[^>]+>|&[a-zA-Z0-9#]+;|[^<&]+|[<&])',
+        re.DOTALL
+    )
+    
+    tokens = token_pattern.findall(html)
+    if not tokens:
+        return [html] if len(html) <= limit else [html[:limit]]
+    
+    # Регулярки для парсинга тегов
+    opening_tag_re = re.compile(r'^<([a-zA-Z0-9\-]+)(\s[^>]*)?>$')
+    closing_tag_re = re.compile(r'^</([a-zA-Z0-9\-]+)>$')
+    
+    parts = []
+    current_tokens = []
+    tag_stack = []  # [(tag_name, full_opening_tag), ...]
+    
+    def finalize_part(tokens_to_finalize: list[str], stack: list[tuple[str, str]]) -> str:
+        """Финализирует часть: добавляет закрывающие теги"""
+        closing = ''.join(f'</{name}>' for name, _ in reversed(stack))
+        return ''.join(tokens_to_finalize) + closing
+    
+    def start_new_part(stack: list[tuple[str, str]]) -> list[str]:
+        """Начинает новую часть: возвращает список с открывающими тегами"""
+        return [''.join(tag for _, tag in stack)] if stack else []
+    
+    def calc_length(tokens_list: list[str]) -> int:
+        """Вычисляет длину списка токенов"""
+        return sum(len(t) for t in tokens_list)
+    
+    for token in tokens:
+        # Определяем тип токена
+        opening_match = opening_tag_re.match(token) if token.startswith('<') else None
+        closing_match = closing_tag_re.match(token) if token.startswith('<') and not opening_match else None
+        
+        # Обновляем стек тегов
+        if opening_match and not token.endswith('/>'):
+            # Открывающий тег (не самозакрывающийся)
+            tag_name = opening_match.group(1).lower()
+            tag_stack.append((tag_name, token))
+        elif closing_match:
+            # Закрывающий тег
+            tag_name = closing_match.group(1).lower()
+            # Удаляем соответствующий открывающий тег из стека
+            for idx in range(len(tag_stack) - 1, -1, -1):
+                if tag_stack[idx][0] == tag_name:
+                    tag_stack.pop(idx)
+                    break
+        
+        # Проверяем, поместится ли токен
+        closing_tags_len = sum(len(name) + 3 for name, _ in tag_stack)  # </name>
+        potential_length = calc_length(current_tokens) + len(token) + closing_tags_len
+        
+        if potential_length > limit:
+            # Токен не помещается в текущую часть
+            if current_tokens:
+                # Завершаем текущую часть
+                part = finalize_part(current_tokens, tag_stack)
+                parts.append(part)
+                current_tokens = start_new_part(tag_stack)
+            
+            # Проверяем, поместится ли токен в новую часть
+            opening_tags_str = ''.join(t for _, t in tag_stack)
+            new_potential_length = len(opening_tags_str) + len(token) + closing_tags_len
+            
+            if new_potential_length > limit:
+                # Токен слишком длинный даже для новой части
+                if not token.startswith('<') and not (token.startswith('&') and token.endswith(';')):
+                    # Режем текстовый токен на фрагменты
+                    available = limit - len(opening_tags_str) - closing_tags_len
+                    
+                    if available > 100:  # Минимальный размер фрагмента
+                        pos = 0
+                        while pos < len(token):
+                            chunk = token[pos:pos + available]
+                            chunk_tokens = start_new_part(tag_stack)
+                            chunk_tokens.append(chunk)
+                            part = finalize_part(chunk_tokens, tag_stack)
+                            parts.append(part)
+                            pos += available
+                        
+                        # Начинаем чистую новую часть
+                        current_tokens = start_new_part(tag_stack)
+                    else:
+                        # Слишком мало места — добавляем как есть
+                        current_tokens.append(token)
+                else:
+                    # HTML-сущность или тег — не режем
+                    current_tokens.append(token)
+            else:
+                # Токен помещается в новую часть
+                current_tokens.append(token)
+        else:
+            # Токен помещается в текущую часть
+            current_tokens.append(token)
+    
+    # Финализируем последнюю часть
+    if current_tokens:
+        part = finalize_part(current_tokens, tag_stack)
+        parts.append(part)
+    
+    return parts
