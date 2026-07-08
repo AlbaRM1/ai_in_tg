@@ -1,0 +1,26 @@
+# Telegram Bot Framework
+aiogram==3.15.0
+
+# Database (async PostgreSQL)
+SQLAlchemy==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+
+# LLM Integration
+# Using litellm without strict version to resolve aiohttp conflict
+# litellm will use compatible aiohttp version with aiogram
+litellm>=1.50.0,<2.0.0
+httpx==0.28.1
+
+# Configuration & Security
+# aiogram 3.15.0 requires pydantic<2.10
+pydantic==2.9.2
+pydantic-settings==2.6.1
+cryptography==44.0.0
+python-dotenv==1.0.1
+
+# Utilities
+pytz==2024.2
+
+# Document Processing
+pypdf==6.14.2
