@@ -3,7 +3,7 @@
 Загружает параметры из переменных окружения (.env файл).
 """
 
-from pydantic import Field, PostgresDsn
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,9 +17,9 @@ class Settings(BaseSettings):
     )
 
     # Database
-    DATABASE_URL: PostgresDsn = Field(
+    DATABASE_URL: str = Field(
         ...,
-        description="URL подключения к PostgreSQL (asyncpg), например: postgresql+asyncpg://user:pass@localhost/dbname",
+        description="URL подключения к БД. PostgreSQL (основной): postgresql+asyncpg://user:pass@localhost/dbname; SQLite (запасной): sqlite+aiosqlite:///./bot.db",
     )
 
     # Security

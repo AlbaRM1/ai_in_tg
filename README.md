@@ -31,7 +31,7 @@
 ## 📋 Требования
 
 - Python 3.12+ (проект протестирован на 3.14, но для продакшена рекомендуется 3.12)
-- PostgreSQL 14+
+- PostgreSQL 14+ (рекомендуется) **или** SQLite 3+ (запасной вариант)
 - Telegram Bot Token (от [@BotFather](https://t.me/BotFather))
 
 ## 🚀 Быстрый старт
@@ -87,6 +87,21 @@ postgres=# CREATE USER llm_user WITH PASSWORD 'your_secure_password';
 postgres=# GRANT ALL PRIVILEGES ON DATABASE llm_bot TO llm_user;
 postgres=# \q
 ```
+
+**Запасной вариант: SQLite (без PostgreSQL)**
+
+Если PostgreSQL не заводится или недоступен, можно использовать локальный SQLite как запасной вариант:
+
+1. В файле `.env` укажите SQLite-строку подключения:
+   ```env
+   DATABASE_URL=sqlite+aiosqlite:///./bot.db
+   ```
+
+2. Скрипт `./setup_db.sh` НЕ нужен — таблицы создаются автоматически при первом запуске `python main.py`
+
+3. Файл `bot.db` создастся в корне проекта (он в `.gitignore` и не попадёт в репозиторий)
+
+**⚠️ Важно:** SQLite — крайний случай для локальной разработки или тестирования. Для продакшена рекомендуется PostgreSQL (лучшая производительность, поддержка JSONB, concurrent access).
 
 ### 3. Конфигурация
 

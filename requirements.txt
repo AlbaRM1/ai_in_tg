@@ -1,9 +1,10 @@
 # Telegram Bot Framework
 aiogram==3.15.0
 
-# Database (async PostgreSQL)
+# Database (async PostgreSQL + SQLite fallback)
 SQLAlchemy==2.0.36
 asyncpg==0.30.0
+aiosqlite
 alembic==1.14.0
 
 # LLM Integration

@@ -1,6 +1,6 @@
 """
 SQLAlchemy 2.0 async модели базы данных.
-Используется asyncpg драйвер для PostgreSQL.
+Поддерживает PostgreSQL (asyncpg) и SQLite (aiosqlite) как запасной вариант.
 """
 
 import uuid
@@ -13,12 +13,16 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     String,
     Text,
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+# Кросс-совместимый тип для JSONB (PostgreSQL) с fallback на JSON (SQLite)
+JSONVariant = JSONB().with_variant(JSON(), "sqlite")
 
 
 class Base(DeclarativeBase):
@@ -207,7 +211,7 @@ class ChatSession(Base):
         BigInteger, nullable=True, comment="ID закреплённого инфо-сообщения о модели"
     )
     topic_renamed: Mapped[bool] = mapped_column(
-        Boolean, default=False, nullable=False, server_default="false",
+        Boolean, default=False, nullable=False,
         comment="Флаг: топик переименован по первому сообщению"
     )
     system_prompt: Mapped[str | None] = mapped_column(
@@ -261,7 +265,7 @@ class Message(Base):
         Text, nullable=False, comment="Содержимое сообщения (простой текст)"
     )
     content_parts: Mapped[list | None] = mapped_column(
-        JSONB,
+        JSONVariant,
         nullable=True,
         comment="Мультимодальный контент (текст + изображения) в формате OpenAI",
     )
