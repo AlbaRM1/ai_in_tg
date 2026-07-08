@@ -1,10 +1,13 @@
 """
 Настройка подключения к БД и session factory для SQLAlchemy 2.0 async.
 Поддерживает PostgreSQL (asyncpg) и SQLite (aiosqlite) как запасной вариант.
+Managed-PostgreSQL (Neon, Supabase) с SSL и pooler-совместимостью.
 """
 
 import logging
+import ssl
 from collections.abc import AsyncGenerator
+from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
@@ -22,6 +25,55 @@ logger = logging.getLogger(__name__)
 DATABASE_URL_STR = str(settings.DATABASE_URL)
 IS_SQLITE = DATABASE_URL_STR.startswith("sqlite")
 
+
+def _prepare_postgres_url_and_args(url: str) -> tuple[str, dict]:
+    """
+    Подготовка PostgreSQL URL и connect_args для managed-провайдеров (Neon/Supabase).
+    
+    asyncpg не понимает libpq-параметры (sslmode, channel_binding) в URL.
+    Извлекаем sslmode из query-строки и конвертируем в SSL-контекст для connect_args.
+    Удаляем несовместимые параметры из URL.
+    
+    Args:
+        url: исходный DATABASE_URL (postgresql+asyncpg://...)
+    
+    Returns:
+        tuple: (cleaned_url, connect_args_dict)
+    """
+    parts = urlsplit(url)
+    query_params = parse_qs(parts.query, keep_blank_values=True)
+    
+    # Извлекаем sslmode (если есть)
+    sslmode_list = query_params.pop("sslmode", None)
+    sslmode = sslmode_list[0] if sslmode_list else None
+    
+    # Удаляем другие libpq-параметры, которые asyncpg не понимает
+    query_params.pop("channel_binding", None)
+    
+    # Собираем очищенный URL
+    new_query = urlencode(query_params, doseq=True)
+    cleaned_parts = parts._replace(query=new_query)
+    cleaned_url = urlunsplit(cleaned_parts)
+    
+    # Настройка connect_args
+    connect_args = {
+        # Для Neon pooler (pgbouncer в transaction mode) отключаем statement cache
+        "statement_cache_size": 0,
+    }
+    
+    # SSL: если sslmode указан, создаём SSL-контекст
+    if sslmode in ("require", "verify-ca", "verify-full"):
+        ssl_context = ssl.create_default_context()
+        # Для "require" разрешаем self-signed сертификаты
+        if sslmode == "require":
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+        connect_args["ssl"] = ssl_context
+        logger.info(f"SSL включён для PostgreSQL (sslmode={sslmode})")
+    
+    return cleaned_url, connect_args
+
+
 # Создаём async engine с учётом диалекта
 if IS_SQLITE:
     # SQLite: не используем pool-параметры, добавляем connect_args
@@ -32,15 +84,19 @@ if IS_SQLITE:
     )
     logger.info("Используется SQLite (aiosqlite) в режиме запасной БД")
 else:
-    # PostgreSQL: используем pool-параметры
+    # PostgreSQL: подготовка URL и connect_args для managed-провайдеров
+    cleaned_url, pg_connect_args = _prepare_postgres_url_and_args(DATABASE_URL_STR)
+    
     engine = create_async_engine(
-        DATABASE_URL_STR,
+        cleaned_url,
         echo=False,
-        pool_pre_ping=True,
+        pool_pre_ping=True,  # Важно для бесплатных тиров (они засыпают)
         pool_size=10,
         max_overflow=20,
+        pool_recycle=300,  # Переиспользовать соединения максимум 5 минут
+        connect_args=pg_connect_args,
     )
-    logger.info("Используется PostgreSQL (asyncpg)")
+    logger.info("Используется PostgreSQL (asyncpg) с поддержкой managed-провайдеров")
 
 # Session factory
 async_session_factory = async_sessionmaker(

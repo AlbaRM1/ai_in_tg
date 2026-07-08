@@ -103,6 +103,66 @@ postgres=# \q
 
 **⚠️ Важно:** SQLite — крайний случай для локальной разработки или тестирования. Для продакшена рекомендуется PostgreSQL (лучшая производительность, поддержка JSONB, concurrent access).
 
+### 2.1. Хостинг БД: Managed-PostgreSQL (Neon / Supabase)
+
+**Зачем это нужно:**
+
+Бесплатные хосты приложений (Render Free Tier, Railway Trial, Fly.io, и т.д.) могут **внезапно удаляться** при бездействии или истечении пробного периода. При использовании локальной БД на хосте все данные будут потеряны.
+
+**Managed-PostgreSQL** (Neon, Supabase) решает эту проблему:
+- ✅ Данные живут **вне хоста приложения** (в облачной БД)
+- ✅ При переезде на новый хост достаточно **передеплоить приложение** с тем же `DATABASE_URL`
+- ✅ Бэкапы и восстановление **не требуются**
+- ✅ Бесплатные тиры: Neon (0.5 ГБ, 10 часов compute/месяц), Supabase (500 МБ, 2 ГБ bandwidth)
+
+#### Получение бесплатной БД
+
+**Вариант 1: Neon (рекомендуется)**
+
+1. Зарегистрируйтесь на [neon.tech](https://neon.tech)
+2. Создайте новый проект (выберите регион ближе к вашему хосту)
+3. Скопируйте **Pooled connection string** (важно для serverless-окружений)
+4. Приведите строку к формату проекта:
+   ```env
+   # Исходная строка от Neon:
+   # postgresql://user:password@ep-xxxxx.eu-central-1.aws.neon.tech/dbname?sslmode=require
+   
+   # Формат для проекта (добавьте +asyncpg):
+   DATABASE_URL=postgresql+asyncpg://user:password@ep-xxxxx.eu-central-1.aws.neon.tech/dbname?sslmode=require
+   ```
+5. Готово! Код автоматически обработает SSL и настроит совместимость с pooler.
+
+**Вариант 2: Supabase**
+
+1. Зарегистрируйтесь на [supabase.com](https://supabase.com)
+2. Создайте новый проект
+3. Перейдите в **Project Settings → Database → Connection string**
+4. Используйте **Connection pooling** (режим Transaction для pgBouncer)
+5. Приведите строку к формату проекта:
+   ```env
+   # Исходная строка от Supabase (pooler):
+   # postgresql://postgres.xxxxx:[YOUR-PASSWORD]@aws-0-eu-central-1.pooler.supabase.com:5432/postgres
+   
+   # Формат для проекта (добавьте +asyncpg и ?sslmode=require):
+   DATABASE_URL=postgresql+asyncpg://postgres.xxxxx:password@aws-0-eu-central-1.pooler.supabase.com:5432/postgres?sslmode=require
+   ```
+
+#### Важные детали
+
+- **SSL обязателен**: managed-провайдеры требуют TLS-соединение (`?sslmode=require` в URL)
+- **Pooler-совместимость**: код автоматически выставляет `statement_cache_size=0` для корректной работы с pgBouncer (Neon pooler)
+- **Автовосстановление соединений**: `pool_pre_ping=True` и `pool_recycle=300` защищают от разрывов при засыпании бесплатного тира
+- **Локальный PostgreSQL не ломается**: если в URL нет `sslmode`, SSL не используется
+
+#### Миграция на новый хост
+
+При переезде на новый бесплатный хост приложения:
+
+1. Задеплойте приложение на новый хост (Render / Railway / Fly.io)
+2. В переменные окружения укажите **тот же** `DATABASE_URL` от Neon/Supabase
+3. Все данные (пользователи, эндпоинты, история чатов) автоматически доступны
+4. **Бэкапы не нужны** — данные уже в облаке!
+
 ### 3. Конфигурация
 
 Скопируйте `.env.example` в `.env` и заполните:
