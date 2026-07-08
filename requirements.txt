@@ -25,3 +25,5 @@ pytz==2024.2
 
 # Document Processing
 pypdf==6.14.2
+
+greenlet
