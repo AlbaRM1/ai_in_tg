@@ -21,8 +21,32 @@ from app.database.models import Base
 
 logger = logging.getLogger(__name__)
 
+
+def _normalize_database_url(url: str) -> str:
+    """
+    Нормализует DATABASE_URL: заменяет голую схему 'postgresql://' на
+    'postgresql+asyncpg://', чтобы SQLAlchemy не пытался загрузить
+    синхронный psycopg2 по умолчанию.
+
+    Если указана схема 'postgres://' (устаревший Heroku-формат) — тоже
+    исправляем.  Все остальные схемы (sqlite+aiosqlite://, уже правильный
+    postgresql+asyncpg://) возвращаются без изменений.
+    """
+    for bare in ("postgres://", "postgresql://"):
+        if url.startswith(bare):
+            fixed = "postgresql+asyncpg://" + url[len(bare):]
+            logger.warning(
+                "DATABASE_URL содержит схему '%s' без указания драйвера. "
+                "Автоматически заменено на 'postgresql+asyncpg://'. "
+                "Укажите явный драйвер в DATABASE_URL, чтобы убрать это предупреждение.",
+                bare,
+            )
+            return fixed
+    return url
+
+
 # Определение диалекта БД по DATABASE_URL
-DATABASE_URL_STR = str(settings.DATABASE_URL)
+DATABASE_URL_STR = _normalize_database_url(str(settings.DATABASE_URL))
 IS_SQLITE = DATABASE_URL_STR.startswith("sqlite")
 
 
