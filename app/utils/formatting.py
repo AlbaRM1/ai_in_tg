@@ -4,7 +4,10 @@
 """
 
 import html
+import logging
 import re
+
+logger = logging.getLogger(__name__)
 
 
 def escape_html(text: str) -> str:
@@ -88,8 +91,10 @@ def markdown_to_telegram_html(text: str) -> str:
         return key
     
     # 1. Вырезаем блоки кода (```...```) и заменяем плейсхолдерами
+    # Единая регулярка: group(1) — опциональный язык, group(2) — код.
+    # Покрывает оба случая: с языком (```python\n...\n```) и без (```\n...\n```).
     def replace_code_block(match):
-        lang = match.group(1) if match.group(1) else ""
+        lang = match.group(1).strip() if match.group(1) else ""
         code = match.group(2)
         # Экранируем содержимое блока кода
         escaped_code = escape_html(code.strip())
@@ -98,11 +103,9 @@ def markdown_to_telegram_html(text: str) -> str:
         else:
             html_code = f'<pre><code>{escaped_code}</code></pre>'
         return make_placeholder(html_code)
-    
-    # Блоки кода с языком: ```lang\n...\n```
-    text = re.sub(r"```(\w+)\n(.*?)```", replace_code_block, text, flags=re.DOTALL)
-    # Блоки кода без языка: ```\n...\n``` или ``` ... ```
-    text = re.sub(r"```\n?(.*?)```", replace_code_block, text, flags=re.DOTALL)
+
+    # Единый паттерн: опциональный язык (group 1) + код (group 2)
+    text = re.sub(r"```([a-zA-Z0-9_+\-]*)\n?(.*?)```", replace_code_block, text, flags=re.DOTALL)
     
     # 2. Вырезаем инлайн-код (`code`) и заменяем плейсхолдерами
     def replace_inline_code(match):
@@ -185,41 +188,48 @@ def format_for_telegram(text: str, parse_thinking: bool = True) -> str:
     Returns:
         Отформатированный Telegram HTML текст
     """
-    # 1. Парсим thinking-блоки (до конвертации markdown, чтобы не затронуть их содержимое)
-    if parse_thinking:
-        # Вырезаем thinking-блоки, конвертируем их содержимое отдельно
-        thinking_blocks = {}
-        thinking_counter = [0]
-        
-        def extract_thinking(match):
-            content = match.group(1).strip()
-            # Конвертируем markdown внутри thinking-блока
-            converted_content = markdown_to_telegram_html(content)
-            key = f"\x00THINKING_{thinking_counter[0]}\x00"
-            thinking_counter[0] += 1
-            thinking_blocks[key] = f'<blockquote expandable>💭 Thought Process\n{converted_content}\n</blockquote>'
-            return key
-        
-        patterns = [
-            r"<think>(.*?)</think>",
-            r"<thinking>(.*?)</thinking>",
-            r"<thought>(.*?)</thought>",
-        ]
-        
-        for pattern in patterns:
-            text = re.sub(pattern, extract_thinking, text, flags=re.DOTALL | re.IGNORECASE)
-        
-        # 2. Конвертируем основной текст из Markdown в HTML
-        text = markdown_to_telegram_html(text)
-        
-        # 3. Возвращаем thinking-блоки
-        for key, block in thinking_blocks.items():
-            text = text.replace(key, block)
-    else:
-        # Просто конвертируем markdown
-        text = markdown_to_telegram_html(text)
-    
-    return text
+    try:
+        # 1. Парсим thinking-блоки (до конвертации markdown, чтобы не затронуть их содержимое)
+        if parse_thinking:
+            # Вырезаем thinking-блоки, конвертируем их содержимое отдельно
+            thinking_blocks = {}
+            thinking_counter = [0]
+
+            def extract_thinking(match):
+                content = match.group(1).strip()
+                # Конвертируем markdown внутри thinking-блока
+                converted_content = markdown_to_telegram_html(content)
+                key = f"\x00THINKING_{thinking_counter[0]}\x00"
+                thinking_counter[0] += 1
+                thinking_blocks[key] = f'<blockquote expandable>💭 Thought Process\n{converted_content}\n</blockquote>'
+                return key
+
+            patterns = [
+                r"<think>(.*?)</think>",
+                r"<thinking>(.*?)</thinking>",
+                r"<thought>(.*?)</thought>",
+            ]
+
+            for pattern in patterns:
+                text = re.sub(pattern, extract_thinking, text, flags=re.DOTALL | re.IGNORECASE)
+
+            # 2. Конвертируем основной текст из Markdown в HTML
+            text = markdown_to_telegram_html(text)
+
+            # 3. Возвращаем thinking-блоки
+            for key, block in thinking_blocks.items():
+                text = text.replace(key, block)
+        else:
+            # Просто конвертируем markdown
+            text = markdown_to_telegram_html(text)
+
+        return text
+
+    except Exception as exc:
+        # Безопасный fallback: при любой ошибке форматирования возвращаем
+        # экранированный plain-text, чтобы бот гарантированно отправил ответ.
+        logger.warning("Ошибка форматирования Markdown→HTML, fallback на plain text: %s", exc)
+        return escape_html(text)
 
 
 def sanitize_for_streaming(text: str) -> str:
