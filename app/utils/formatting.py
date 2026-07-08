@@ -248,6 +248,86 @@ def sanitize_for_streaming(text: str) -> str:
     return text
 
 
+def split_plain_text(text: str, limit: int = 4096) -> list[str]:
+    """
+    Разбивает plain-текст на части, не превышающие лимит символов Telegram.
+    Режет по границам строк и пробелов для читабельности.
+    
+    Args:
+        text: Plain-текст для нарезки
+        limit: Максимальная длина одной части (по умолчанию 4096 — лимит Telegram)
+        
+    Returns:
+        Список частей plain-текста, каждая ≤ limit символов
+    """
+    if not text:
+        return []
+    
+    if len(text) <= limit:
+        return [text]
+    
+    parts = []
+    current_part = ""
+    
+    # Режем по строкам
+    lines = text.split('\n')
+    
+    for line in lines:
+        # Если одна строка длиннее лимита — режем по словам/символам
+        if len(line) > limit:
+            # Сохраняем накопленное
+            if current_part:
+                parts.append(current_part)
+                current_part = ""
+            
+            # Режем длинную строку по словам
+            words = line.split(' ')
+            for word in words:
+                # Если слово само по себе длиннее лимита — режем посимвольно
+                if len(word) > limit:
+                    if current_part:
+                        parts.append(current_part)
+                        current_part = ""
+                    
+                    # Режем слово на части по limit символов
+                    for i in range(0, len(word), limit):
+                        parts.append(word[i:i + limit])
+                else:
+                    # Проверяем, поместится ли слово
+                    test_part = current_part + (' ' if current_part else '') + word
+                    if len(test_part) <= limit:
+                        current_part = test_part
+                    else:
+                        # Не помещается — сохраняем текущую часть и начинаем новую
+                        if current_part:
+                            parts.append(current_part)
+                        current_part = word
+            
+            # Добавляем перевод строки к current_part
+            if current_part:
+                if len(current_part) + 1 <= limit:
+                    current_part += '\n'
+                else:
+                    parts.append(current_part)
+                    current_part = '\n'
+        else:
+            # Обычная строка
+            test_part = current_part + ('\n' if current_part else '') + line
+            if len(test_part) <= limit:
+                current_part = test_part
+            else:
+                # Не помещается — сохраняем текущую часть
+                if current_part:
+                    parts.append(current_part)
+                current_part = line
+    
+    # Добавляем последнюю часть
+    if current_part:
+        parts.append(current_part)
+    
+    return parts
+
+
 def split_html_for_telegram(html: str, limit: int = 4096) -> list[str]:
     """
     Разбивает HTML-текст на части, не превышающие лимит символов Telegram.
@@ -309,23 +389,18 @@ def split_html_for_telegram(html: str, limit: int = 4096) -> list[str]:
         opening_match = opening_tag_re.match(token) if token.startswith('<') else None
         closing_match = closing_tag_re.match(token) if token.startswith('<') and not opening_match else None
         
-        # Обновляем стек тегов
-        if opening_match and not token.endswith('/>'):
-            # Открывающий тег (не самозакрывающийся)
-            tag_name = opening_match.group(1).lower()
-            tag_stack.append((tag_name, token))
-        elif closing_match:
-            # Закрывающий тег
-            tag_name = closing_match.group(1).lower()
-            # Удаляем соответствующий открывающий тег из стека
-            for idx in range(len(tag_stack) - 1, -1, -1):
-                if tag_stack[idx][0] == tag_name:
-                    tag_stack.pop(idx)
-                    break
-        
-        # Проверяем, поместится ли токен
+        # КРИТИЧНО: Проверяем длину ПЕРЕД обновлением стека тегов
+        # Вычисляем длину закрывающих тегов для ТЕКУЩЕГО стека (до добавления нового тега)
         closing_tags_len = sum(len(name) + 3 for name, _ in tag_stack)  # </name>
-        potential_length = calc_length(current_tokens) + len(token) + closing_tags_len
+        
+        # Если это открывающий тег, резервируем место и для него
+        extra_closing_tag_len = 0
+        if opening_match and not token.endswith('/>'):
+            tag_name = opening_match.group(1).lower()
+            extra_closing_tag_len = len(tag_name) + 3  # </tag_name>
+        
+        # Проверяем, поместится ли токен с учётом ВСЕХ закрывающих тегов
+        potential_length = calc_length(current_tokens) + len(token) + closing_tags_len + extra_closing_tag_len
         
         if potential_length > limit:
             # Токен не помещается в текущую часть
@@ -337,13 +412,13 @@ def split_html_for_telegram(html: str, limit: int = 4096) -> list[str]:
             
             # Проверяем, поместится ли токен в новую часть
             opening_tags_str = ''.join(t for _, t in tag_stack)
-            new_potential_length = len(opening_tags_str) + len(token) + closing_tags_len
+            new_potential_length = len(opening_tags_str) + len(token) + closing_tags_len + extra_closing_tag_len
             
             if new_potential_length > limit:
                 # Токен слишком длинный даже для новой части
                 if not token.startswith('<') and not (token.startswith('&') and token.endswith(';')):
                     # Режем текстовый токен на фрагменты
-                    available = limit - len(opening_tags_str) - closing_tags_len
+                    available = limit - len(opening_tags_str) - closing_tags_len - extra_closing_tag_len
                     
                     if available > 100:  # Минимальный размер фрагмента
                         pos = 0
@@ -369,6 +444,20 @@ def split_html_for_telegram(html: str, limit: int = 4096) -> list[str]:
         else:
             # Токен помещается в текущую часть
             current_tokens.append(token)
+        
+        # Теперь обновляем стек тегов ПОСЛЕ проверки и добавления токена
+        if opening_match and not token.endswith('/>'):
+            # Открывающий тег (не самозакрывающийся)
+            tag_name = opening_match.group(1).lower()
+            tag_stack.append((tag_name, token))
+        elif closing_match:
+            # Закрывающий тег
+            tag_name = closing_match.group(1).lower()
+            # Удаляем соответствующий открывающий тег из стека
+            for idx in range(len(tag_stack) - 1, -1, -1):
+                if tag_stack[idx][0] == tag_name:
+                    tag_stack.pop(idx)
+                    break
     
     # Финализируем последнюю часть
     if current_tokens:

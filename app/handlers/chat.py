@@ -32,7 +32,7 @@ from app.services.llm_service import LLMService
 from app.services.message_aggregator import get_aggregator
 from app.services.user_service import get_user
 from app.utils.crypto import decrypt
-from app.utils.formatting import escape_html, format_for_telegram, sanitize_for_streaming, split_html_for_telegram
+from app.utils.formatting import escape_html, format_for_telegram, sanitize_for_streaming, split_html_for_telegram, split_plain_text
 from app.utils.typing import TypingIndicator
 
 logger = logging.getLogger(__name__)
@@ -415,6 +415,8 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
             accumulated_text = ""
             last_update_time = asyncio.get_event_loop().time()
             update_interval = 1.5  # секунды между обновлениями сообщения
+            # Безопасный лимит для предпросмотра во время стриминга (резерв под возможные символы)
+            STREAMING_PREVIEW_LIMIT = 3800
 
             # Отправляем начальное сообщение (отвечаем на первое сообщение батча)
             reply_msg = await first_message.reply("💭 Думаю...")
@@ -431,9 +433,13 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
                         current_time = asyncio.get_event_loop().time()
                         if current_time - last_update_time >= update_interval:
                             try:
-                                # Во время streaming отправляем plain text
+                                # Во время streaming показываем ПРЕДПРОСМОТР (последние N символов)
+                                # чтобы не превысить лимит Telegram 4096. Plain text без parse_mode
+                                # для избежания ошибок невалидного HTML на неполном потоке.
+                                preview_text = accumulated_text[-STREAMING_PREVIEW_LIMIT:] if len(accumulated_text) > STREAMING_PREVIEW_LIMIT else accumulated_text
+                                
                                 await reply_msg.edit_text(
-                                    sanitize_for_streaming(accumulated_text)
+                                    sanitize_for_streaming(preview_text)
                                 )
                                 last_update_time = current_time
                             except TelegramRetryAfter as e:
@@ -480,7 +486,7 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
                 ) -> bool:
                     """
                     Отправляет/редактирует часть с retry при TelegramRetryAfter
-                    и fallback на plain text при TelegramBadRequest.
+                    и fallback на plain text (с нарезкой!) при TelegramBadRequest.
                     
                     Returns:
                         True если успешно, False если не удалось
@@ -506,22 +512,48 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
                             await asyncio.sleep(e.retry_after)
                         except TelegramBadRequest as e:
                             logger.error(
-                                f"Невалидный HTML в части: {e}. Fallback на plain text."
+                                f"Невалидный HTML в финальном сообщении: {e}. Отправка без форматирования."
                             )
-                            # Повторяем без parse_mode (plain text)
+                            # Fallback: нарезаем plain text и отправляем части
                             try:
+                                plain_parts = split_plain_text(text, limit=4096)
+                                
+                                if not plain_parts:
+                                    logger.error("split_plain_text вернул пустой список")
+                                    return False
+                                
+                                # Первая часть — редактируем/отправляем
                                 if is_edit and target_msg:
-                                    await target_msg.edit_text(text)
+                                    try:
+                                        await target_msg.edit_text(plain_parts[0])
+                                    except TelegramBadRequest as edit_err:
+                                        # Edit не удался — отправляем новым сообщением
+                                        logger.warning(f"Fallback edit тоже не удался: {edit_err}. Отправка новым сообщением.")
+                                        await bot.send_message(
+                                            chat_id=chat_id,
+                                            text=plain_parts[0],
+                                            message_thread_id=thread_id,
+                                        )
                                 else:
                                     await bot.send_message(
                                         chat_id=chat_id,
-                                        text=text,
+                                        text=plain_parts[0],
                                         message_thread_id=thread_id,
                                     )
+                                
+                                # Остальные части — отправляем новыми сообщениями
+                                for plain_part in plain_parts[1:]:
+                                    await asyncio.sleep(0.5)  # Анти-флуд
+                                    await bot.send_message(
+                                        chat_id=chat_id,
+                                        text=plain_part,
+                                        message_thread_id=thread_id,
+                                    )
+                                
                                 return True
                             except Exception as fallback_error:
                                 logger.error(
-                                    f"Fallback plain text тоже не удался: {fallback_error}"
+                                    f"Fallback plain text с нарезкой не удался: {fallback_error}"
                                 )
                                 return False
                         except Exception as e:
