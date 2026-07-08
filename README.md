@@ -282,7 +282,7 @@ logging.basicConfig(level=logging.DEBUG)  # Для отладки
 
 ## 📄 Лицензия
 
-MIT (или ваша лицензия)
+MIT
 
 ## 🤝 Вклад
 
