@@ -18,6 +18,7 @@ from app.database.base import init_db
 from app.handlers import chat, registration, settings as settings_handler
 from app.middlewares.auth import AuthMiddleware
 from app.middlewares.database import DatabaseMiddleware
+from app.services.web_search import is_web_search_enabled
 
 # Настройка логирования
 logging.basicConfig(
@@ -36,6 +37,13 @@ async def on_startup(bot: Bot) -> None:
     logger.info("Initializing database...")
     await init_db()
     logger.info("Database initialized successfully")
+
+    # Информируем о статусе веб-поиска (Tavily): помогает диагностировать,
+    # почему модель вызывает/не вызывает инструмент web_search.
+    logger.info(
+        "Web search: %s",
+        "enabled (Tavily key set)" if is_web_search_enabled() else "disabled (no TAVILY_API_KEY)",
+    )
 
     # Установка команд бота
     commands = [

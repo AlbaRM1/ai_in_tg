@@ -425,6 +425,16 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
             # Режим работы: если веб-поиск включён — агентный цикл (не-стриминг с tools),
             # иначе — обычный стриминг с предпросмотром (сохраняем прежнее поведение).
             web_search_active = is_web_search_enabled()
+            if web_search_active:
+                logger.info(
+                    f"Using agentic_completion (web search enabled) для пользователя "
+                    f"{user_id}, топик {thread_id}, модель {session_model}"
+                )
+            else:
+                logger.info(
+                    f"Using streaming (no web search) для пользователя {user_id}, "
+                    f"топик {thread_id}, модель {session_model}"
+                )
 
             try:
                 if web_search_active:

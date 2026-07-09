@@ -24,48 +24,39 @@ logger = logging.getLogger(__name__)
 # Максимальное число итераций агентного цикла с инструментами
 MAX_TOOL_ITERATIONS = 4
 
-# Подстроки в тексте ошибки, указывающие на неподдержку tool/function calling эндпоинтом
-_TOOLS_UNSUPPORTED_MARKERS = (
-    "tool",
-    "function call",
-    "function_call",
-    "functions",
-    "tool_choice",
+# Признаки НЕподдержки tool/function calling эндпоинтом.
+# Требуем одновременно упоминание tools/functions И явную формулировку неподдержки.
+# Список намеренно узкий, чтобы не срабатывать ложно на любые ошибки со словом "tool"
+# (например обычные 4xx/5xx или "invalid" в несвязанном контексте) и не откатывать
+# на путь без инструментов, когда эндпоинт их на самом деле поддерживает.
+_TOOLS_KEYWORDS = ("tool", "function")
+_UNSUPPORTED_PHRASES = (
     "does not support",
     "not supported",
     "unsupported",
     "unknown parameter",
-    "unrecognized",
+    "unrecognized parameter",
+    "unrecognized request argument",
 )
 
 
 def _looks_like_tools_unsupported(error: Exception) -> bool:
     """
-    Эвристика: похоже ли исключение на ошибку неподдержки инструментов эндпоинтом.
+    Эвристика: похоже ли исключение на ЯВНУЮ ошибку неподдержки инструментов эндпоинтом.
+
+    Срабатывает только когда в тексте ошибки есть и упоминание tools/functions,
+    и явная фраза о неподдержке/неизвестном параметре. Широкие маркеры вроде
+    "invalid"/"no such" убраны, чтобы избежать ложного отката на путь без tools.
 
     Args:
         error: Пойманное исключение.
 
     Returns:
-        True если ошибка вероятно связана с неподдержкой tools/function calling.
+        True если ошибка явно связана с неподдержкой tools/function calling.
     """
     text = str(error).lower()
-    # Требуем упоминание tools/functions вместе с признаком неподдержки/невалидного параметра
-    mentions_tools = any(
-        m in text for m in ("tool", "function")
-    )
-    mentions_unsupported = any(
-        m in text
-        for m in (
-            "does not support",
-            "not supported",
-            "unsupported",
-            "unknown parameter",
-            "unrecognized",
-            "invalid",
-            "no such",
-        )
-    )
+    mentions_tools = any(m in text for m in _TOOLS_KEYWORDS)
+    mentions_unsupported = any(p in text for p in _UNSUPPORTED_PHRASES)
     return mentions_tools and mentions_unsupported
 
 
@@ -271,6 +262,11 @@ class LLMService:
             )
             return response.choices[0].message.content or ""
 
+        logger.info(
+            f"agentic_completion: web search enabled, passing tools=[web_search] "
+            f"with tool_choice=auto (model={normalized_model})"
+        )
+
         # Рабочая копия истории (чтобы не мутировать переданный список)
         working_messages: list[dict[str, Any]] = list(messages)
         tools_supported = True
@@ -287,8 +283,9 @@ class LLMService:
             except Exception as e:
                 if tools_supported and _looks_like_tools_unsupported(e):
                     logger.warning(
-                        f"Эндпоинт не поддерживает tool calling ({e}). "
-                        f"Fallback на обычный вызов без инструментов."
+                        f"agentic_completion: tools-unsupported fallback СРАБОТАЛ — "
+                        f"эндпоинт, похоже, не поддерживает tool calling. Причина: {e}. "
+                        f"Повтор запроса БЕЗ инструментов."
                     )
                     tools_supported = False
                     response = await self._acompletion(
@@ -306,7 +303,17 @@ class LLMService:
 
             # Нет tool_calls — это финальный ответ
             if not tool_calls:
+                if tools_supported:
+                    logger.info(
+                        f"agentic_completion: LLM requested tool_calls: 0 "
+                        f"(iteration {iteration + 1}) — returning final answer"
+                    )
                 return message.content or ""
+
+            logger.info(
+                f"agentic_completion: LLM requested tool_calls: {len(tool_calls)} "
+                f"(iteration {iteration + 1})"
+            )
 
             # Есть tool_calls — добавляем сообщение ассистента с tool_calls
             assistant_msg: dict[str, Any] = {

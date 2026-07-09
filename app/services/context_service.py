@@ -11,8 +11,50 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database.models import ChatSession, Message
+from app.services.web_search import is_web_search_enabled
 
 logger = logging.getLogger(__name__)
+
+# Инструкция, добавляемая к системному промпту, когда включён веб-поиск (Tavily).
+# Явно сообщает модели о доступном инструменте web_search и требует активно его
+# использовать для актуальных/свежих данных вместо отказа «нет доступа к интернету».
+WEB_SEARCH_SYSTEM_INSTRUCTION = (
+    "У тебя есть инструмент web_search для поиска в интернете. "
+    "ОБЯЗАТЕЛЬНО вызывай его, когда вопрос касается актуальных/свежих данных "
+    "(погода, новости, курсы валют, спортивные результаты, события, цены, "
+    "текущая дата/время-зависимые факты) или когда ты не уверен в ответе, либо "
+    "информация могла устареть. Никогда не отказывай пользователю фразами про "
+    "отсутствие доступа к интернету или актуальным данным — вместо этого вызови "
+    "web_search. Формулируй конкретный поисковый запрос и отвечай на основе "
+    "полученных результатов. "
+    "You have a web_search tool. You MUST call it for any question about "
+    "up-to-date or real-time information, or when you are unsure — do not refuse "
+    "by saying you lack internet access."
+)
+
+
+def build_system_prompt(base_prompt: str | None) -> str:
+    """
+    Формирует итоговый системный промпт для отправки в LLM.
+
+    Если веб-поиск включён (задан TAVILY_API_KEY), к базовому промпту добавляется
+    инструкция активно использовать инструмент web_search. Базовый промпт из БД
+    при этом не изменяется — дополнение происходит только в рантайме.
+
+    Args:
+        base_prompt: Базовый системный промпт сессии (может быть None/пустым).
+
+    Returns:
+        Итоговый системный промпт (base + инструкция про web_search при включённом поиске).
+    """
+    base = (base_prompt or "").strip()
+
+    if is_web_search_enabled():
+        if base:
+            return f"{base}\n\n{WEB_SEARCH_SYSTEM_INSTRUCTION}"
+        return WEB_SEARCH_SYSTEM_INSTRUCTION
+
+    return base
 
 
 def estimate_tokens_fallback(text: str) -> int:
@@ -96,9 +138,12 @@ async def load_session_history(
     # Формируем историю
     history: list[dict[str, Any]] = []
     
-    # Всегда добавляем system prompt первым
-    if chat_session.system_prompt:
-        history.append({"role": "system", "content": chat_session.system_prompt})
+    # Всегда добавляем system prompt первым.
+    # build_system_prompt при включённом веб-поиске дополняет промпт инструкцией
+    # активно использовать инструмент web_search (в рантайме, без изменения БД).
+    system_prompt = build_system_prompt(chat_session.system_prompt)
+    if system_prompt:
+        history.append({"role": "system", "content": system_prompt})
 
     # Добавляем сообщения из БД
     for msg in messages_db:
