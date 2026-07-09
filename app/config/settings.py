@@ -34,6 +34,13 @@ class Settings(BaseSettings):
         description="Максимальное количество токенов в контексте (200k по умолчанию)",
     )
 
+    # Web Search (Tavily)
+    TAVILY_API_KEY: str | None = Field(
+        default=None,
+        description="Ключ для веб-поиска через Tavily (https://tavily.com). "
+        "Если не задан — веб-поиск отключён, бот работает как обычно.",
+    )
+
     # Model configuration
     model_config = SettingsConfigDict(
         env_file=".env",
