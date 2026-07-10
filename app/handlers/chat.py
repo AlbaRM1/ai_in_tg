@@ -422,12 +422,14 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
             # Отправляем начальное сообщение (отвечаем на первое сообщение батча)
             reply_msg = await first_message.reply("💭 Думаю...")
 
-            # Режим работы: если веб-поиск включён — агентный цикл (не-стриминг с tools),
-            # иначе — обычный стриминг с предпросмотром (сохраняем прежнее поведение).
+            # Режим работы: если веб-поиск включён — агентный СТРИМИНГ с tools
+            # (финальный ответ стримится, на этапе поиска показывается статус),
+            # иначе — обычный стриминг. В обоих случаях финальный ответ обновляется
+            # динамически через один и тот же цикл потребления токенов.
             web_search_active = is_web_search_enabled()
             if web_search_active:
                 logger.info(
-                    f"Using agentic_completion (web search enabled) для пользователя "
+                    f"Using agentic_stream (web search enabled) для пользователя "
                     f"{user_id}, топик {thread_id}, модель {session_model}"
                 )
             else:
@@ -436,61 +438,72 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
                     f"топик {thread_id}, модель {session_model}"
                 )
 
+            # Флаг: после статуса поиска нужно немедленно показать первый токен
+            # финального ответа (сбросить троттлинг), чтобы «🔎 Ищу…» сразу сменился.
+            force_next_update = False
+
+            async def on_search(query: str) -> None:
+                nonlocal force_next_update
+                # Обрезаем длинный запрос для отображения
+                display_query = query if len(query) <= 60 else query[:60].rstrip() + "…"
+                status_text = f"🔎 Ищу в интернете: {display_query}…"
+                try:
+                    await reply_msg.edit_text(status_text)
+                except TelegramRetryAfter as e:
+                    logger.warning(
+                        f"Rate limit при обновлении статуса поиска: retry_after={e.retry_after}s"
+                    )
+                    await asyncio.sleep(e.retry_after)
+                except Exception as e:
+                    logger.warning(f"Не удалось обновить статус поиска: {e}")
+                # После поиска первый пришедший токен должен сразу заменить статус
+                force_next_update = True
+
             try:
+                # Выбираем источник токенов: агентный стрим (с поиском) или обычный стрим
                 if web_search_active:
-                    # Колбэк для обновления статус-сообщения при выполнении поиска
-                    async def on_search(query: str) -> None:
-                        # Обрезаем длинный запрос для отображения
-                        display_query = query if len(query) <= 60 else query[:60].rstrip() + "…"
-                        status_text = f"🔎 Ищу в интернете: {display_query}…"
-                        try:
-                            await reply_msg.edit_text(status_text)
-                        except TelegramRetryAfter as e:
-                            logger.warning(
-                                f"Rate limit при обновлении статуса поиска: retry_after={e.retry_after}s"
-                            )
-                            await asyncio.sleep(e.retry_after)
-                        except Exception as e:
-                            logger.warning(f"Не удалось обновить статус поиска: {e}")
-
-                    async with TypingIndicator(bot, chat_id, thread_id):
-                        accumulated_text = await llm.agentic_completion(
-                            model=session_model,
-                            messages=history,
-                            on_search=on_search,
-                        )
+                    token_source = llm.agentic_stream(
+                        model=session_model,
+                        messages=history,
+                        on_search=on_search,
+                    )
                 else:
-                    async with TypingIndicator(bot, chat_id, thread_id):
-                        async for token in llm.stream_chat_completion(
-                            model=session_model,
-                            messages=history,
-                        ):
-                            accumulated_text += token
+                    token_source = llm.stream_chat_completion(
+                        model=session_model,
+                        messages=history,
+                    )
 
-                            # Throttled update: обновляем раз в 1.5 сек
-                            current_time = asyncio.get_event_loop().time()
-                            if current_time - last_update_time >= update_interval:
-                                try:
-                                    # Во время streaming показываем ПРЕДПРОСМОТР (последние N символов)
-                                    # чтобы не превысить лимит Telegram 4096. Plain text без parse_mode
-                                    # для избежания ошибок невалидного HTML на неполном потоке.
-                                    preview_text = accumulated_text[-STREAMING_PREVIEW_LIMIT:] if len(accumulated_text) > STREAMING_PREVIEW_LIMIT else accumulated_text
+                # Единый цикл потребления токенов с троттлингом и предпросмотром.
+                async with TypingIndicator(bot, chat_id, thread_id):
+                    async for token in token_source:
+                        accumulated_text += token
 
-                                    await reply_msg.edit_text(
-                                        sanitize_for_streaming(preview_text)
-                                    )
-                                    last_update_time = current_time
-                                except TelegramRetryAfter as e:
-                                    # Rate limit от Telegram — ждём и продолжаем
-                                    logger.warning(
-                                        f"Rate limit при streaming edit: retry_after={e.retry_after}s"
-                                    )
-                                    await asyncio.sleep(e.retry_after)
-                                except Exception as e:
-                                    # Другие ошибки редактирования — логируем и продолжаем
-                                    logger.warning(
-                                        f"Не удалось отредактировать сообщение при streaming: {e}"
-                                    )
+                        # Throttled update: обновляем раз в update_interval сек,
+                        # либо немедленно после завершения поиска (force_next_update).
+                        current_time = asyncio.get_event_loop().time()
+                        if force_next_update or (current_time - last_update_time >= update_interval):
+                            try:
+                                # Во время streaming показываем ПРЕДПРОСМОТР (последние N символов)
+                                # чтобы не превысить лимит Telegram 4096. Plain text без parse_mode
+                                # для избежания ошибок невалидного HTML на неполном потоке.
+                                preview_text = accumulated_text[-STREAMING_PREVIEW_LIMIT:] if len(accumulated_text) > STREAMING_PREVIEW_LIMIT else accumulated_text
+
+                                await reply_msg.edit_text(
+                                    sanitize_for_streaming(preview_text)
+                                )
+                                last_update_time = current_time
+                                force_next_update = False
+                            except TelegramRetryAfter as e:
+                                # Rate limit от Telegram — ждём и продолжаем
+                                logger.warning(
+                                    f"Rate limit при streaming edit: retry_after={e.retry_after}s"
+                                )
+                                await asyncio.sleep(e.retry_after)
+                            except Exception as e:
+                                # Другие ошибки редактирования — логируем и продолжаем
+                                logger.warning(
+                                    f"Не удалось отредактировать сообщение при streaming: {e}"
+                                )
 
             except asyncio.TimeoutError:
                 await reply_msg.edit_text("❌ Timeout: модель не ответила вовремя.")

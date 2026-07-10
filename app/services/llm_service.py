@@ -226,6 +226,238 @@ class LLMService:
 
         return await acompletion(**kwargs)
 
+    async def _astream(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        temperature: float,
+        max_tokens: int | None,
+        use_tools: bool,
+    ) -> Any:
+        """
+        Обёртка над acompletion (стриминг) с опциональной передачей tools.
+
+        Args:
+            model: Уже нормализованное имя модели.
+            messages: История сообщений.
+            temperature: Температура.
+            max_tokens: Максимум токенов.
+            use_tools: Передавать ли tools=[web_search] и tool_choice="auto".
+
+        Returns:
+            Async-итератор чанков litellm (в формате OpenAI).
+        """
+        kwargs: dict[str, Any] = dict(
+            model=model,
+            messages=messages,
+            api_base=self.base_url,
+            api_key=self.api_key,
+            stream=True,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=self.timeout,
+        )
+        if use_tools:
+            kwargs["tools"] = [WEB_SEARCH_TOOL]
+            kwargs["tool_choice"] = "auto"
+
+        return await acompletion(**kwargs)
+
+    @staticmethod
+    def _accumulate_tool_call_deltas(
+        accumulator: dict[int, dict[str, Any]],
+        delta_tool_calls: Any,
+    ) -> None:
+        """
+        Аккумулирует дельты tool_calls из стрим-чанков в accumulator по index.
+
+        litellm/OpenAI при стриминге присылают tool_calls кусочками: id/name
+        обычно приходят в первом чанке для данного index, а arguments — по частям.
+        Склеиваем всё по числовому index.
+
+        Args:
+            accumulator: Словарь {index: {"id", "name", "arguments"}} — мутируется на месте.
+            delta_tool_calls: Список ChatCompletionDeltaToolCallChunk из delta.tool_calls.
+        """
+        for tc in delta_tool_calls:
+            index = getattr(tc, "index", None)
+            if index is None:
+                index = 0
+            slot = accumulator.setdefault(
+                index, {"id": None, "name": None, "arguments": ""}
+            )
+
+            tc_id = getattr(tc, "id", None)
+            if tc_id:
+                slot["id"] = tc_id
+
+            func = getattr(tc, "function", None)
+            if func is not None:
+                name = getattr(func, "name", None)
+                if name:
+                    slot["name"] = name
+                args = getattr(func, "arguments", None)
+                if args:
+                    slot["arguments"] += args
+
+    async def agentic_stream(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        temperature: float = 0.7,
+        max_tokens: int | None = None,
+        on_search: Callable[[str], Awaitable[None]] | None = None,
+    ) -> AsyncGenerator[str, None]:
+        """
+        Агентный цикл с tool calling (веб-поиск), СТРИМЯЩИЙ финальный ответ.
+
+        На каждой итерации выполняется СТРИМИНГОВЫЙ вызов с tools. Во время стрима
+        аккумулируются дельты tool_calls и контента:
+        - Если по завершении стрима модель запросила tool_calls — выполняем их
+          (вызывая on_search для UI-статуса) и идём на следующую итерацию.
+          Контентные токены этой промежуточной итерации НЕ отдаются наружу
+          (это внутренние рассуждения перед вызовом инструмента).
+        - Если tool_calls нет — это финальный ответ, который уже стримился наружу
+          по мере поступления контентных дельт. Дополнительных вызовов нет.
+
+        Если веб-поиск выключен — просто обычный стриминг без инструментов.
+        Если эндпоинт не поддерживает tools — graceful fallback на стриминг без tools.
+
+        Args:
+            model: Название модели.
+            messages: История сообщений в формате OpenAI.
+            temperature: Температура генерации.
+            max_tokens: Максимум токенов.
+            on_search: Опциональный async-колбэк, вызывается с текстом запроса
+                перед выполнением веб-поиска (для обновления статуса в UI).
+
+        Yields:
+            Токены финального ответа ассистента по мере генерации.
+        """
+        normalized_model = self._normalize_model(model)
+
+        # Веб-поиск выключен — обычный стриминг без tools
+        if not is_web_search_enabled():
+            async for token in self.stream_chat_completion(
+                model, messages, temperature, max_tokens
+            ):
+                yield token
+            return
+
+        logger.info(
+            f"agentic_stream: web search enabled, streaming with tools=[web_search] "
+            f"tool_choice=auto (model={normalized_model})"
+        )
+
+        working_messages: list[dict[str, Any]] = list(messages)
+        tools_supported = True
+
+        for iteration in range(MAX_TOOL_ITERATIONS):
+            content_buffer = ""
+            tool_calls_acc: dict[int, dict[str, Any]] = {}
+
+            try:
+                stream = await self._astream(
+                    normalized_model,
+                    working_messages,
+                    temperature,
+                    max_tokens,
+                    use_tools=tools_supported,
+                )
+            except Exception as e:
+                if tools_supported and _looks_like_tools_unsupported(e):
+                    logger.warning(
+                        f"agentic_stream: tools-unsupported fallback СРАБОТАЛ — "
+                        f"эндпоинт, похоже, не поддерживает tool calling. Причина: {e}. "
+                        f"Стриминг БЕЗ инструментов."
+                    )
+                    tools_supported = False
+                    async for token in self.stream_chat_completion(
+                        model, working_messages, temperature, max_tokens
+                    ):
+                        yield token
+                    return
+                raise
+
+            # Собираем стрим текущей итерации.
+            # Если это финальная итерация (без tool_calls) — токены контента отдаём наружу.
+            # Но заранее мы не знаем, будет ли tool_call. Стратегия: буферизуем контент
+            # и yield'им его немедленно ТОЛЬКО если tool_calls ещё не появились.
+            # Модели, вызывающие инструменты, как правило не шлют пользовательский
+            # контент до tool_calls; но чтобы не «протечь» промежуточный контент в UI,
+            # держим yield до конца стрима и решаем по факту наличия tool_calls.
+            async for chunk in stream:
+                if not (hasattr(chunk, "choices") and len(chunk.choices) > 0):
+                    continue
+                delta = chunk.choices[0].delta
+
+                delta_tool_calls = getattr(delta, "tool_calls", None)
+                if delta_tool_calls:
+                    self._accumulate_tool_call_deltas(tool_calls_acc, delta_tool_calls)
+
+                content = getattr(delta, "content", None)
+                if content:
+                    content_buffer += content
+
+            # Итерация без tool_calls — это финальный ответ. Стримим его наружу.
+            if not tool_calls_acc:
+                if tools_supported:
+                    logger.info(
+                        f"agentic_stream: no tool_calls (iteration {iteration + 1}) "
+                        f"— streaming final answer ({len(content_buffer)} chars buffered)"
+                    )
+                if content_buffer:
+                    yield content_buffer
+                return
+
+            logger.info(
+                f"agentic_stream: LLM requested tool_calls: {len(tool_calls_acc)} "
+                f"(iteration {iteration + 1})"
+            )
+
+            # Добавляем сообщение ассистента с tool_calls (в порядке index)
+            ordered = [tool_calls_acc[i] for i in sorted(tool_calls_acc.keys())]
+            assistant_msg: dict[str, Any] = {
+                "role": "assistant",
+                "content": content_buffer or "",
+                "tool_calls": [
+                    {
+                        "id": slot["id"],
+                        "type": "function",
+                        "function": {
+                            "name": slot["name"],
+                            "arguments": slot["arguments"] or "{}",
+                        },
+                    }
+                    for slot in ordered
+                ],
+            }
+            working_messages.append(assistant_msg)
+
+            # Выполняем каждый tool_call, добавляя role="tool" результаты
+            for slot in ordered:
+                tool_result = await self._handle_tool_call_args(
+                    slot["name"], slot["arguments"], on_search
+                )
+                working_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": slot["id"],
+                        "name": slot["name"],
+                        "content": tool_result,
+                    }
+                )
+
+        # Достигнут лимит итераций — финальный стриминг БЕЗ инструментов
+        logger.warning(
+            f"agentic_stream: достигнут лимит итераций ({MAX_TOOL_ITERATIONS}). "
+            f"Финальный стриминг без инструментов."
+        )
+        async for token in self.stream_chat_completion(
+            model, working_messages, temperature, max_tokens
+        ):
+            yield token
+
     async def agentic_completion(
         self,
         model: str,
@@ -361,24 +593,47 @@ class LLMService:
         on_search: Callable[[str], Awaitable[None]] | None,
     ) -> str:
         """
-        Выполняет один tool_call и возвращает строковый результат для role="tool".
+        Выполняет один tool_call (объект) и возвращает строковый результат.
+
+        Обёртка над _handle_tool_call_args для не-стримингового пути, где
+        доступен объект tool_call с полями function.name/function.arguments.
 
         Args:
             tool_call: Объект tool_call из ответа модели.
             on_search: Опциональный async-колбэк для UI-статуса поиска.
 
         Returns:
+            Результат инструмента (строка).
+        """
+        name = getattr(tool_call.function, "name", None)
+        raw_args = getattr(tool_call.function, "arguments", "") or ""
+        return await self._handle_tool_call_args(name, raw_args, on_search)
+
+    async def _handle_tool_call_args(
+        self,
+        name: str | None,
+        raw_args: str,
+        on_search: Callable[[str], Awaitable[None]] | None,
+    ) -> str:
+        """
+        Выполняет инструмент по имени и сырым аргументам, возвращает результат
+        для role="tool". Используется как стриминговым (аккумулированные дельты),
+        так и не-стриминговым путём.
+
+        Args:
+            name: Имя инструмента.
+            raw_args: Сырая строка аргументов (JSON с полем query).
+            on_search: Опциональный async-колбэк для UI-статуса поиска.
+
+        Returns:
             Результат инструмента (строка). При неизвестном инструменте или
             битых аргументах — понятное сообщение об ошибке.
         """
-        name = getattr(tool_call.function, "name", None)
-
         if name != "web_search":
             logger.warning(f"Запрошен неизвестный инструмент: {name}")
             return f"Ошибка: инструмент '{name}' не поддерживается."
 
-        # Парсим аргументы (JSON с полем query)
-        raw_args = getattr(tool_call.function, "arguments", "") or ""
+        raw_args = raw_args or ""
         try:
             args = json.loads(raw_args) if raw_args else {}
         except (json.JSONDecodeError, TypeError) as e:
