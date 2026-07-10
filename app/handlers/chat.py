@@ -414,6 +414,10 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
 
             # 13. Streaming генерация с typing-индикатором
             accumulated_text = ""
+            # Отслеживаем последний фактически отправленный в Telegram текст,
+            # чтобы не делать бессмысленный edit (который приводит к
+            # "message is not modified") ни во время стрима, ни на финальном шаге.
+            last_sent_text: str | None = None
             last_update_time = asyncio.get_event_loop().time()
             update_interval = 1.5  # секунды между обновлениями сообщения
             # Безопасный лимит для предпросмотра во время стриминга (резерв под возможные символы)
@@ -487,10 +491,13 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
                                 # чтобы не превысить лимит Telegram 4096. Plain text без parse_mode
                                 # для избежания ошибок невалидного HTML на неполном потоке.
                                 preview_text = accumulated_text[-STREAMING_PREVIEW_LIMIT:] if len(accumulated_text) > STREAMING_PREVIEW_LIMIT else accumulated_text
+                                preview_text = sanitize_for_streaming(preview_text)
 
-                                await reply_msg.edit_text(
-                                    sanitize_for_streaming(preview_text)
-                                )
+                                # Пропускаем edit, если текст не изменился с прошлого раза —
+                                # иначе Telegram вернёт "message is not modified".
+                                if preview_text != last_sent_text:
+                                    await reply_msg.edit_text(preview_text)
+                                    last_sent_text = preview_text
                                 last_update_time = current_time
                                 force_next_update = False
                             except TelegramRetryAfter as e:
@@ -499,6 +506,16 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
                                     f"Rate limit при streaming edit: retry_after={e.retry_after}s"
                                 )
                                 await asyncio.sleep(e.retry_after)
+                            except TelegramBadRequest as e:
+                                # "message is not modified" — не ошибка: текст уже актуален.
+                                if "message is not modified" in str(e).lower():
+                                    last_sent_text = preview_text
+                                    last_update_time = current_time
+                                    force_next_update = False
+                                else:
+                                    logger.warning(
+                                        f"Не удалось отредактировать сообщение при streaming: {e}"
+                                    )
                             except Exception as e:
                                 # Другие ошибки редактирования — логируем и продолжаем
                                 logger.warning(
@@ -542,6 +559,7 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
                     Returns:
                         True если успешно, False если не удалось
                     """
+                    nonlocal last_sent_text
                     max_retries = 3
                     for attempt in range(max_retries):
                         try:
@@ -562,6 +580,15 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
                             )
                             await asyncio.sleep(e.retry_after)
                         except TelegramBadRequest as e:
+                            # "message is not modified" — не ошибка: текущий текст сообщения
+                            # уже идентичен целевому. Это НЕ повод слать новое сообщение
+                            # (иначе получаем дубликат) и НЕ повод делать fallback.
+                            if "message is not modified" in str(e).lower():
+                                logger.debug(
+                                    "Финальный edit пропущен: message is not modified "
+                                    "(текст уже актуален)."
+                                )
+                                return True
                             logger.error(
                                 f"Невалидный HTML в финальном сообщении: {e}. Отправка без форматирования."
                             )
@@ -578,13 +605,21 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
                                     try:
                                         await target_msg.edit_text(plain_parts[0])
                                     except TelegramBadRequest as edit_err:
-                                        # Edit не удался — отправляем новым сообщением
-                                        logger.warning(f"Fallback edit тоже не удался: {edit_err}. Отправка новым сообщением.")
-                                        await bot.send_message(
-                                            chat_id=chat_id,
-                                            text=plain_parts[0],
-                                            message_thread_id=thread_id,
-                                        )
+                                        # "message is not modified" — текст уже актуален:
+                                        # НЕ шлём новое сообщение (иначе дубликат), считаем успехом.
+                                        if "message is not modified" in str(edit_err).lower():
+                                            logger.debug(
+                                                "Fallback edit пропущен: message is not modified "
+                                                "(текст уже актуален)."
+                                            )
+                                        else:
+                                            # Реальная ошибка edit — отправляем новым сообщением
+                                            logger.warning(f"Fallback edit тоже не удался: {edit_err}. Отправка новым сообщением.")
+                                            await bot.send_message(
+                                                chat_id=chat_id,
+                                                text=plain_parts[0],
+                                                message_thread_id=thread_id,
+                                            )
                                 else:
                                     await bot.send_message(
                                         chat_id=chat_id,
@@ -620,11 +655,21 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
                 
                 # Если одна часть — просто редактируем существующее сообщение
                 if len(parts) == 1:
-                    success = await send_part_with_retry(
-                        parts[0],
-                        is_edit=True,
-                        target_msg=reply_msg,
-                    )
+                    # Пропускаем бессмысленный финальный edit: если HTML-форматированный
+                    # текст идентичен последнему отправленному во время стрима preview —
+                    # редактировать нечего (Telegram вернул бы "message is not modified").
+                    if parts[0] == last_sent_text:
+                        logger.debug(
+                            "Финальный edit пропущен: текст идентичен последнему "
+                            "отправленному во время стриминга."
+                        )
+                        success = True
+                    else:
+                        success = await send_part_with_retry(
+                            parts[0],
+                            is_edit=True,
+                            target_msg=reply_msg,
+                        )
                     if not success:
                         logger.error("Не удалось отправить единственную часть ответа")
                 else:

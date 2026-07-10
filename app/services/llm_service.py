@@ -380,12 +380,16 @@ class LLMService:
                 raise
 
             # Собираем стрим текущей итерации.
-            # Если это финальная итерация (без tool_calls) — токены контента отдаём наружу.
-            # Но заранее мы не знаем, будет ли tool_call. Стратегия: буферизуем контент
-            # и yield'им его немедленно ТОЛЬКО если tool_calls ещё не появились.
-            # Модели, вызывающие инструменты, как правило не шлют пользовательский
-            # контент до tool_calls; но чтобы не «протечь» промежуточный контент в UI,
-            # держим yield до конца стрима и решаем по факту наличия tool_calls.
+            # Заранее неизвестно, будет ли tool_call. Стратегия инкрементальной отдачи:
+            # пока в стриме НЕ появилось ни одной tool_call-дельты — контентные дельты
+            # отдаём наружу немедленно (это финальный ответ, стримим по мере генерации).
+            # Как только пришла первая tool_call-дельта — переключаемся в режим
+            # накопления: контент больше не yield'им (это внутренние рассуждения перед
+            # вызовом инструмента), а копим его в буфер для сообщения ассистента.
+            # Модели, вызывающие инструменты, шлют tool_calls в начале стрима (до
+            # пользовательского контента), поэтому «протечки» промежуточного контента
+            # в UI не происходит.
+            tool_call_seen = False
             async for chunk in stream:
                 if not (hasattr(chunk, "choices") and len(chunk.choices) > 0):
                     continue
@@ -393,21 +397,24 @@ class LLMService:
 
                 delta_tool_calls = getattr(delta, "tool_calls", None)
                 if delta_tool_calls:
+                    tool_call_seen = True
                     self._accumulate_tool_call_deltas(tool_calls_acc, delta_tool_calls)
 
                 content = getattr(delta, "content", None)
                 if content:
                     content_buffer += content
+                    # Пока инструмент не запрошен — отдаём контент инкрементально.
+                    if not tool_call_seen:
+                        yield content
 
-            # Итерация без tool_calls — это финальный ответ. Стримим его наружу.
+            # Итерация без tool_calls — это финальный ответ.
             if not tool_calls_acc:
                 if tools_supported:
                     logger.info(
                         f"agentic_stream: no tool_calls (iteration {iteration + 1}) "
-                        f"— streaming final answer ({len(content_buffer)} chars buffered)"
+                        f"— final answer streamed incrementally ({len(content_buffer)} chars total)"
                     )
-                if content_buffer:
-                    yield content_buffer
+                # Контент уже был отдан инкрементально в цикле выше — повторный yield не нужен.
                 return
 
             logger.info(
