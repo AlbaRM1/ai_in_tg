@@ -13,6 +13,8 @@ from typing import Any
 import httpx
 from litellm import acompletion
 
+from app.config import settings
+
 from app.services.web_search import (
     WEB_SEARCH_TOOL,
     is_web_search_enabled,
@@ -75,6 +77,28 @@ class LLMService:
         self.timeout = timeout
 
     @staticmethod
+    def _resolve_temperature(temperature: float | None) -> float | None:
+        """
+        Определяет фактическое значение temperature для запроса.
+
+        По умолчанию (temperature is None) берётся значение из настройки
+        LLM_TEMPERATURE, которая тоже по умолчанию None. Итог: если ни явно,
+        ни в настройках temperature не задана — параметр НЕ должен попасть
+        в запрос (некоторые модели, напр. Claude Opus 4, возвращают ошибку
+        "temperature is deprecated for this model").
+
+        Args:
+            temperature: Явно переданное значение или None.
+
+        Returns:
+            float для передачи в acompletion, либо None — тогда параметр
+            не передаётся вовсе.
+        """
+        if temperature is not None:
+            return temperature
+        return settings.LLM_TEMPERATURE
+
+    @staticmethod
     def _normalize_model(model_name: str) -> str:
         """
         Нормализует имя модели для litellm.
@@ -97,7 +121,7 @@ class LLMService:
         self,
         model: str,
         messages: list[dict[str, str]],
-        temperature: float = 0.7,
+        temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> AsyncGenerator[str, None]:
         """
@@ -119,17 +143,23 @@ class LLMService:
         try:
             # Нормализуем имя модели для litellm (добавляем префикс openai/ для OpenAI-совместимых API)
             normalized_model = self._normalize_model(model)
-            
-            response = await acompletion(
+
+            kwargs: dict[str, Any] = dict(
                 model=normalized_model,
                 messages=messages,
                 api_base=self.base_url,
                 api_key=self.api_key,
                 stream=True,
-                temperature=temperature,
                 max_tokens=max_tokens,
                 timeout=self.timeout,
             )
+            # temperature передаём ТОЛЬКО если он явно определён (иначе некоторые
+            # модели, напр. Claude Opus 4, падают с "temperature is deprecated").
+            resolved_temperature = self._resolve_temperature(temperature)
+            if resolved_temperature is not None:
+                kwargs["temperature"] = resolved_temperature
+
+            response = await acompletion(**kwargs)
 
             # Стриминг токенов
             async for chunk in response:
@@ -150,7 +180,7 @@ class LLMService:
         self,
         model: str,
         messages: list[dict[str, str]],
-        temperature: float = 0.7,
+        temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> str:
         """
@@ -168,17 +198,21 @@ class LLMService:
         try:
             # Нормализуем имя модели для litellm (добавляем префикс openai/ для OpenAI-совместимых API)
             normalized_model = self._normalize_model(model)
-            
-            response = await acompletion(
+
+            kwargs: dict[str, Any] = dict(
                 model=normalized_model,
                 messages=messages,
                 api_base=self.base_url,
                 api_key=self.api_key,
                 stream=False,
-                temperature=temperature,
                 max_tokens=max_tokens,
                 timeout=self.timeout,
             )
+            resolved_temperature = self._resolve_temperature(temperature)
+            if resolved_temperature is not None:
+                kwargs["temperature"] = resolved_temperature
+
+            response = await acompletion(**kwargs)
 
             return response.choices[0].message.content
 
@@ -193,7 +227,7 @@ class LLMService:
         self,
         model: str,
         messages: list[dict[str, Any]],
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         use_tools: bool,
     ) -> Any:
@@ -203,7 +237,7 @@ class LLMService:
         Args:
             model: Уже нормализованное имя модели.
             messages: История сообщений.
-            temperature: Температура.
+            temperature: Температура (None — параметр не передаётся в запрос).
             max_tokens: Максимум токенов.
             use_tools: Передавать ли tools=[web_search] и tool_choice="auto".
 
@@ -216,10 +250,12 @@ class LLMService:
             api_base=self.base_url,
             api_key=self.api_key,
             stream=False,
-            temperature=temperature,
             max_tokens=max_tokens,
             timeout=self.timeout,
         )
+        resolved_temperature = self._resolve_temperature(temperature)
+        if resolved_temperature is not None:
+            kwargs["temperature"] = resolved_temperature
         if use_tools:
             kwargs["tools"] = [WEB_SEARCH_TOOL]
             kwargs["tool_choice"] = "auto"
@@ -230,7 +266,7 @@ class LLMService:
         self,
         model: str,
         messages: list[dict[str, Any]],
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         use_tools: bool,
     ) -> Any:
@@ -240,7 +276,7 @@ class LLMService:
         Args:
             model: Уже нормализованное имя модели.
             messages: История сообщений.
-            temperature: Температура.
+            temperature: Температура (None — параметр не передаётся в запрос).
             max_tokens: Максимум токенов.
             use_tools: Передавать ли tools=[web_search] и tool_choice="auto".
 
@@ -253,10 +289,12 @@ class LLMService:
             api_base=self.base_url,
             api_key=self.api_key,
             stream=True,
-            temperature=temperature,
             max_tokens=max_tokens,
             timeout=self.timeout,
         )
+        resolved_temperature = self._resolve_temperature(temperature)
+        if resolved_temperature is not None:
+            kwargs["temperature"] = resolved_temperature
         if use_tools:
             kwargs["tools"] = [WEB_SEARCH_TOOL]
             kwargs["tool_choice"] = "auto"
@@ -304,7 +342,7 @@ class LLMService:
         self,
         model: str,
         messages: list[dict[str, Any]],
-        temperature: float = 0.7,
+        temperature: float | None = None,
         max_tokens: int | None = None,
         on_search: Callable[[str], Awaitable[None]] | None = None,
     ) -> AsyncGenerator[str, None]:
@@ -469,7 +507,7 @@ class LLMService:
         self,
         model: str,
         messages: list[dict[str, Any]],
-        temperature: float = 0.7,
+        temperature: float | None = None,
         max_tokens: int | None = None,
         on_search: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:

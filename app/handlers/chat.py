@@ -29,6 +29,12 @@ from app.services.context_service import (
 )
 from app.services.endpoint_service import get_endpoint
 from app.services.llm_service import LLMService
+
+try:
+    # Специфичные исключения litellm для дружелюбной обработки ошибок.
+    from litellm.exceptions import ContextWindowExceededError
+except Exception:  # pragma: no cover - на случай изменения структуры litellm
+    ContextWindowExceededError = None  # type: ignore[assignment, misc]
 from app.services.message_aggregator import get_aggregator
 from app.services.user_service import get_user
 from app.services.web_search import is_web_search_enabled
@@ -39,6 +45,39 @@ from app.utils.typing import TypingIndicator
 logger = logging.getLogger(__name__)
 
 router = Router()
+
+# Маркеры переполнения контекста в тексте ошибки (для случаев, когда litellm
+# оборачивает ContextWindowExceededError в BadRequestError и класс не совпадает).
+_CONTEXT_WINDOW_ERROR_MARKERS = (
+    "contextwindowexceedederror",
+    "context window",
+    "input is too long",
+    "too long for requested model",
+    "maximum context length",
+    "prompt is too long",
+)
+
+
+def _is_context_window_error(error: Exception) -> bool:
+    """
+    Определяет, связана ли ошибка с переполнением контекстного окна модели.
+
+    Проверяет как класс исключения (litellm ContextWindowExceededError), так и
+    текст (на случай, когда исключение обёрнуто в BadRequestError — как в
+    реальных логах, где вся цепочка fallback'ов приходит одной строкой).
+
+    Args:
+        error: Пойманное исключение.
+
+    Returns:
+        True, если ошибка про переполнение контекста.
+    """
+    if ContextWindowExceededError is not None and isinstance(
+        error, ContextWindowExceededError
+    ):
+        return True
+    text = str(error).lower()
+    return any(marker in text for marker in _CONTEXT_WINDOW_ERROR_MARKERS)
 
 
 async def get_or_create_session(
@@ -529,6 +568,19 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
                 )
                 return
             except Exception as e:
+                # Дружелюбная обработка переполнения контекста: даже после обрезки
+                # истории модель (или её fallback с меньшим окном) может вернуть
+                # ContextWindowExceededError. Показываем понятное сообщение вместо
+                # сырого стектрейса litellm.
+                if _is_context_window_error(e):
+                    logger.warning(
+                        f"Контекст переполнен для пользователя {user_id}, топик {thread_id}: {e}"
+                    )
+                    await reply_msg.edit_text(
+                        "❌ Контекст диалога слишком большой и не помещается в модель. "
+                        "Начните новый топик/сессию или сократите запрос, чтобы продолжить."
+                    )
+                    return
                 logger.error(f"Ошибка LLM streaming: {e}", exc_info=True)
                 error_text = str(e).replace("&", "&").replace("<", "<").replace(">", ">")
                 await reply_msg.edit_text(f"❌ Ошибка генерации: {error_text}")
@@ -729,6 +781,22 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
             )
 
         except Exception as e:
+            # Переполнение контекста может прилететь и вне streaming-блока —
+            # показываем дружелюбное сообщение вместо сырого стектрейса.
+            if _is_context_window_error(e):
+                logger.warning(
+                    f"Контекст переполнен (обработка батча) для пользователя "
+                    f"{user_id}, топик {thread_id}: {e}"
+                )
+                try:
+                    await first_message.reply(
+                        "❌ Контекст диалога слишком большой и не помещается в модель. "
+                        "Начните новый топик/сессию или сократите запрос, чтобы продолжить."
+                    )
+                except Exception as reply_error:
+                    logger.error(f"Не удалось отправить сообщение об ошибке: {reply_error}")
+                return
+
             logger.error(
                 f"Непредвиденная ошибка при обработке батча сообщений: {e}",
                 exc_info=True,

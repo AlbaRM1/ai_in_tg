@@ -30,8 +30,20 @@ class Settings(BaseSettings):
 
     # Context Management
     MAX_CONTEXT_TOKENS: int = Field(
-        default=200_000,
-        description="Максимальное количество токенов в контексте (200k по умолчанию)",
+        default=100_000,
+        description="Максимальное количество токенов в контексте. Консервативный "
+        "дефолт (100k) с запасом под окно fallback-моделей и под неточность оценки "
+        "токенов (особенно на кириллице). При переполнении история обрезается — "
+        "отбрасываются самые старые сообщения, system prompt сохраняется.",
+    )
+
+    # LLM generation parameters
+    LLM_TEMPERATURE: float | None = Field(
+        default=None,
+        description="Температура генерации LLM. По умолчанию None — параметр НЕ "
+        "передаётся в запрос (важно: некоторые модели, напр. Claude Opus 4, "
+        "возвращают ошибку 'temperature is deprecated for this model'). Задайте "
+        "число (напр. 0.7), только если ваша модель точно поддерживает temperature.",
     )
 
     # Web Search (Tavily)
