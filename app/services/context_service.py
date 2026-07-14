@@ -202,10 +202,15 @@ async def load_session_history(
     # count_tokens автоматически уйдёт в консервативный fallback.
     token_model = getattr(chat_session, "model_name", None) or chat_session.model
 
-    # Загружаем все сообщения сессии (отсортированы по created_at в модели)
+    # Загружаем только несжатые сообщения (compressed=False).
+    # Сжатые сообщения заменены резюме (is_summary=True), которые загружаем.
+    # Сортировка по created_at сохраняет хронологический порядок.
     result = await session.execute(
         select(Message)
-        .where(Message.session_id == chat_session.id)
+        .where(
+            Message.session_id == chat_session.id,
+            Message.compressed == False  # noqa: E712
+        )
         .order_by(Message.created_at)
     )
     messages_db = result.scalars().all()
@@ -220,7 +225,7 @@ async def load_session_history(
     if system_prompt:
         history.append({"role": "system", "content": system_prompt})
 
-    # Добавляем сообщения из БД
+    # Добавляем сообщения из БД (только несжатые + резюме)
     for msg in messages_db:
         # Если есть content_parts (мультимодальный формат) — используем его
         if msg.content_parts:
@@ -309,6 +314,77 @@ async def llm_compress_history(
     return summary.strip()
 
 
+async def _persist_compression_to_db(
+    session: AsyncSession,
+    chat_session: ChatSession,
+    num_compressed_messages: int,
+    summaries: list[str],
+    token_model: str,
+) -> None:
+    """
+    Сохраняет результат LLM-сжатия в БД.
+    
+    Помечает самые старые несжатые сообщения как compressed=True и создаёт
+    резюме-сообщения с is_summary=True.
+
+    Args:
+        session: DB сессия
+        chat_session: Сессия чата
+        num_compressed_messages: Количество сообщений, которые были сжаты
+        summaries: Список резюме (по одному на каждую итерацию сжатия)
+        token_model: Модель для подсчёта токенов
+    """
+    # Загружаем самые старые несжатые сообщения (по количеству)
+    result = await session.execute(
+        select(Message)
+        .where(
+            Message.session_id == chat_session.id,
+            Message.compressed == False  # noqa: E712
+        )
+        .order_by(Message.created_at)
+        .limit(num_compressed_messages)
+    )
+    messages_to_compress = result.scalars().all()
+
+    if not messages_to_compress:
+        logger.warning(
+            f"No messages found to mark as compressed for session {chat_session.id}"
+        )
+        return
+
+    # Помечаем как compressed
+    for msg in messages_to_compress:
+        msg.compressed = True
+    
+    logger.info(
+        f"Marked {len(messages_to_compress)} messages as compressed in session {chat_session.id}"
+    )
+
+    # Создаём резюме-сообщения (с created_at = самое раннее из сжатых, чтобы сохранить порядок)
+    earliest_time = messages_to_compress[0].created_at if messages_to_compress else datetime.now(timezone.utc)
+    
+    for i, summary_text in enumerate(summaries):
+        summary_msg = Message(
+            session_id=chat_session.id,
+            role="assistant",
+            content=f"[Резюме предыдущего контекста, часть {i+1}]\n{summary_text}",
+            token_count=count_tokens(
+                token_model,
+                [{"role": "assistant", "content": summary_text}]
+            ),
+            compressed=False,  # Резюме само не сжато
+            is_summary=True,   # Это резюме
+            created_at=earliest_time,  # Ставим время самого раннего сжатого сообщения
+        )
+        session.add(summary_msg)
+    
+    logger.info(
+        f"Created {len(summaries)} summary message(s) for session {chat_session.id}"
+    )
+
+    await session.flush()
+
+
 async def compress_history(
     session: AsyncSession,
     chat_session: ChatSession,
@@ -384,11 +460,13 @@ async def compress_history(
                 # Итеративное сжатие: сжимаем батчами, пока не уложимся в лимит
                 # или не достигнем максимума итераций.
                 summaries = []  # Накапливаем резюме от каждой итерации
+                compressed_batches = []  # Списки сообщений, которые были сжаты (для пометки в БД)
                 iteration = 0
                 
                 while iteration < _MAX_COMPRESSION_ITERATIONS and len(old_part) > 0:
                     # Берём батч для сжатия (первые N сообщений старой части)
                     batch_to_compress = old_part[:_MAX_MESSAGES_PER_COMPRESSION_BATCH]
+                    compressed_batches.append(batch_to_compress)  # Запоминаем для пометки в БД
                     old_part = old_part[_MAX_MESSAGES_PER_COMPRESSION_BATCH:]
                     
                     iteration += 1
@@ -442,6 +520,18 @@ async def compress_history(
                                 f"✅ Контекст сжат: {initial_tokens} → {current_tokens} токенов "
                                 f"({iteration} итер.)"
                             )
+
+                        # Сохраняем сжатие в БД: помечаем старые сообщения как compressed,
+                        # добавляем резюме-сообщения.
+                        # Количество сжатых сообщений = сумма всех батчей
+                        num_compressed = sum(len(batch) for batch in compressed_batches)
+                        await _persist_compression_to_db(
+                            session=session,
+                            chat_session=chat_session,
+                            num_compressed_messages=num_compressed,
+                            summaries=summaries,
+                            token_model=token_model,
+                        )
 
                         # Возвращаем system prompt + сжатую историю
                         result = []

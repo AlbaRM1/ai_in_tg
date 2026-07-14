@@ -248,6 +248,10 @@ class Message(Base):
         {"type": "text", "text": "описание изображения"},
         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
     ]
+    
+    Поддержка LLM-сжатия:
+    - compressed=True: сообщение заменено резюме, не загружается в контекст
+    - is_summary=True: это резюме-сообщение (результат сжатия батча)
     """
 
     __tablename__ = "messages"
@@ -272,6 +276,14 @@ class Message(Base):
     token_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, comment="Количество токенов"
     )
+    compressed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False,
+        comment="Сообщение сжато (заменено резюме), не загружается в контекст"
+    )
+    is_summary: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False,
+        comment="Это резюме-сообщение (результат LLM-сжатия)"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -280,4 +292,7 @@ class Message(Base):
     # Relationships
     session: Mapped[ChatSession] = relationship(back_populates="messages")
 
-    __table_args__ = (Index("idx_session_created", "session_id", "created_at"),)
+    __table_args__ = (
+        Index("idx_session_created", "session_id", "created_at"),
+        Index("idx_session_compressed", "session_id", "compressed"),
+    )
