@@ -75,6 +75,10 @@ _RECENT_PAIRS_TO_KEEP = 10
 # выполняется итеративно или откатывается к простой обрезке.
 _MAX_MESSAGES_PER_COMPRESSION_BATCH = 80
 
+# Максимальное количество итераций LLM-сжатия (защита от бесконечного цикла).
+# При каждой итерации сжимается батч из _MAX_MESSAGES_PER_COMPRESSION_BATCH сообщений.
+_MAX_COMPRESSION_ITERATIONS = 5
+
 # Промпт для LLM-сжатия контекста (универсальный, компактный).
 _COMPRESSION_PROMPT = """Сократи эту историю диалога до компактного резюме, сохраняя ключевые факты, выводы, решения и важную контекстную информацию. Убери повторы и избыточные детали. Резюме должно быть понятным для продолжения разговора.
 
@@ -377,61 +381,90 @@ async def compress_history(
                     # Нечего сжимать — весь контент в "свежем хвосте"
                     raise ValueError("History too short for LLM compression after tail split")
 
-                # Ограничиваем батч для сжатия: берём только первые N сообщений
-                # старой части, чтобы гарантированно влезть в окно fallback-модели.
-                # Остаток старой части (если есть) останется несжатым в этой итерации
-                # и будет обработан при следующем переполнении или простой обрезкой.
-                batch_to_compress = old_part[:_MAX_MESSAGES_PER_COMPRESSION_BATCH]
-                remaining_old = old_part[_MAX_MESSAGES_PER_COMPRESSION_BATCH:]
-
-                logger.info(
-                    f"Compressing batch of {len(batch_to_compress)} messages "
-                    f"(remaining old: {len(remaining_old)}, recent tail: {len(recent_tail)})"
-                )
-
-                # Запрашиваем LLM-сжатие батча
-                summary = await llm_compress_history(
-                    chat_session=chat_session,
-                    history_to_compress=batch_to_compress,
-                    api_key=api_key,
-                    base_url=endpoint.base_url,
-                )
-
-                # Формируем сжатую историю: резюме + оставшаяся старая часть + свежий хвост
-                compressed_history = [
-                    {"role": "assistant", "content": f"[Резюме предыдущего контекста]\n{summary}"}
-                ] + remaining_old + recent_tail
-
-                # Проверяем, что сжатие помогло
-                final_tokens = count_tokens(
-                    token_model,
-                    ([system_prompt] if system_prompt else []) + compressed_history,
-                )
-
-                if final_tokens <= max_tokens:
+                # Итеративное сжатие: сжимаем батчами, пока не уложимся в лимит
+                # или не достигнем максимума итераций.
+                summaries = []  # Накапливаем резюме от каждой итерации
+                iteration = 0
+                
+                while iteration < _MAX_COMPRESSION_ITERATIONS and len(old_part) > 0:
+                    # Берём батч для сжатия (первые N сообщений старой части)
+                    batch_to_compress = old_part[:_MAX_MESSAGES_PER_COMPRESSION_BATCH]
+                    old_part = old_part[_MAX_MESSAGES_PER_COMPRESSION_BATCH:]
+                    
+                    iteration += 1
                     logger.info(
-                        f"LLM compression successful for session {chat_session.id}: "
-                        f"{initial_tokens} → {final_tokens} tokens"
+                        f"Compression iteration {iteration}/{_MAX_COMPRESSION_ITERATIONS}: "
+                        f"compressing {len(batch_to_compress)} messages "
+                        f"(remaining old: {len(old_part)}, recent tail: {len(recent_tail)})"
                     )
                     
-                    # Показываем финальный статус
-                    if compression_callback:
+                    # Обновляем статус для пользователя
+                    if compression_callback and iteration > 1:
                         await compression_callback(
-                            f"✅ Контекст сжат: {initial_tokens} → {final_tokens} токенов"
+                            f"🔄 Контекст сжимается... (итерация {iteration})"
                         )
 
-                    # Возвращаем system prompt + сжатую историю
-                    result = []
-                    if system_prompt:
-                        result.append(system_prompt)
-                    result.extend(compressed_history)
-                    return result
-                else:
-                    logger.warning(
-                        f"LLM compression didn't fit in limit for session {chat_session.id}: "
-                        f"{final_tokens} > {max_tokens}. Falling back to simple truncation."
+                    # Запрашиваем LLM-сжатие батча
+                    summary = await llm_compress_history(
+                        chat_session=chat_session,
+                        history_to_compress=batch_to_compress,
+                        api_key=api_key,
+                        base_url=endpoint.base_url,
                     )
-                    # Откатываемся к простой обрезке (ниже)
+                    summaries.append(summary)
+
+                    # Формируем текущую сжатую историю: все резюме + оставшаяся старая часть + свежий хвост
+                    compressed_history = [
+                        {"role": "assistant", "content": f"[Резюме предыдущего контекста, часть {i+1}]\n{s}"}
+                        for i, s in enumerate(summaries)
+                    ] + old_part + recent_tail
+
+                    # Проверяем, уложились ли в лимит
+                    current_tokens = count_tokens(
+                        token_model,
+                        ([system_prompt] if system_prompt else []) + compressed_history,
+                    )
+                    
+                    logger.info(
+                        f"After iteration {iteration}: {initial_tokens} → {current_tokens} tokens"
+                    )
+
+                    if current_tokens <= max_tokens:
+                        # Успех! Уложились в лимит
+                        logger.info(
+                            f"LLM compression successful for session {chat_session.id} "
+                            f"after {iteration} iteration(s): {initial_tokens} → {current_tokens} tokens"
+                        )
+                        
+                        # Показываем финальный статус
+                        if compression_callback:
+                            await compression_callback(
+                                f"✅ Контекст сжат: {initial_tokens} → {current_tokens} токенов "
+                                f"({iteration} итер.)"
+                            )
+
+                        # Возвращаем system prompt + сжатую историю
+                        result = []
+                        if system_prompt:
+                            result.append(system_prompt)
+                        result.extend(compressed_history)
+                        return result
+                    
+                    # Ещё не уложились — продолжаем цикл, если есть что сжимать
+                    if len(old_part) == 0:
+                        # Больше нечего сжимать, но всё ещё не влезли
+                        logger.warning(
+                            f"LLM compression completed {iteration} iterations but didn't fit: "
+                            f"{current_tokens} > {max_tokens}. Falling back to simple truncation."
+                        )
+                        break
+                
+                # Если вышли из цикла (достигли MAX_ITERATIONS или нечего сжимать),
+                # но всё ещё не влезли — откатываемся к простой обрезке (ниже)
+                logger.warning(
+                    f"LLM compression exhausted {iteration} iterations for session {chat_session.id}. "
+                    f"Falling back to simple truncation."
+                )
 
         except Exception as e:
             logger.warning(
