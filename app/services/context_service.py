@@ -69,6 +69,12 @@ _MIN_CONTEXT_LIMIT = 1_000
 # при LLM-сжатии контекста (оставляет "свежий хвост" для детального контекста).
 _RECENT_PAIRS_TO_KEEP = 10
 
+# Максимальное количество сообщений для отправки в LLM на сжатие за один раз.
+# Ограничение нужно, чтобы батч гарантированно влезал в окно fallback-модели
+# (например, claude-sonnet с меньшим окном). При очень длинной истории сжатие
+# выполняется итеративно или откатывается к простой обрезке.
+_MAX_MESSAGES_PER_COMPRESSION_BATCH = 80
+
 # Промпт для LLM-сжатия контекста (универсальный, компактный).
 _COMPRESSION_PROMPT = """Сократи эту историю диалога до компактного резюме, сохраняя ключевые факты, выводы, решения и важную контекстную информацию. Убери повторы и избыточные детали. Резюме должно быть понятным для продолжения разговора.
 
@@ -371,18 +377,30 @@ async def compress_history(
                     # Нечего сжимать — весь контент в "свежем хвосте"
                     raise ValueError("History too short for LLM compression after tail split")
 
-                # Запрашиваем LLM-сжатие старой части
+                # Ограничиваем батч для сжатия: берём только первые N сообщений
+                # старой части, чтобы гарантированно влезть в окно fallback-модели.
+                # Остаток старой части (если есть) останется несжатым в этой итерации
+                # и будет обработан при следующем переполнении или простой обрезкой.
+                batch_to_compress = old_part[:_MAX_MESSAGES_PER_COMPRESSION_BATCH]
+                remaining_old = old_part[_MAX_MESSAGES_PER_COMPRESSION_BATCH:]
+
+                logger.info(
+                    f"Compressing batch of {len(batch_to_compress)} messages "
+                    f"(remaining old: {len(remaining_old)}, recent tail: {len(recent_tail)})"
+                )
+
+                # Запрашиваем LLM-сжатие батча
                 summary = await llm_compress_history(
                     chat_session=chat_session,
-                    history_to_compress=old_part,
+                    history_to_compress=batch_to_compress,
                     api_key=api_key,
                     base_url=endpoint.base_url,
                 )
 
-                # Заменяем старую часть одним резюме-сообщением роли assistant
+                # Формируем сжатую историю: резюме + оставшаяся старая часть + свежий хвост
                 compressed_history = [
                     {"role": "assistant", "content": f"[Резюме предыдущего контекста]\n{summary}"}
-                ] + recent_tail
+                ] + remaining_old + recent_tail
 
                 # Проверяем, что сжатие помогло
                 final_tokens = count_tokens(
