@@ -441,8 +441,20 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
             )
             await session.commit()
 
-            # 11. Загружаем полную историю
-            history = await load_session_history(session, chat_session)
+            # 11. Загружаем полную историю (с callback для статуса сжатия)
+            # Отправляем начальное сообщение для потенциального статуса сжатия
+            status_msg = await first_message.reply("💭 Подготовка...")
+            
+            async def compression_status_callback(status: str) -> None:
+                """Показывает статус сжатия контекста пользователю."""
+                try:
+                    await status_msg.edit_text(status)
+                except Exception as e:
+                    logger.warning(f"Не удалось обновить статус сжатия: {e}")
+            
+            history = await load_session_history(
+                session, chat_session, compression_callback=compression_status_callback
+            )
 
             # 12. Создаём LLM service
             llm = LLMService(
@@ -462,8 +474,13 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
             # Безопасный лимит для предпросмотра во время стриминга (резерв под возможные символы)
             STREAMING_PREVIEW_LIMIT = 3800
 
-            # Отправляем начальное сообщение (отвечаем на первое сообщение батча)
-            reply_msg = await first_message.reply("💭 Думаю...")
+            # Используем существующее сообщение для ответа (переписываем статус)
+            try:
+                await status_msg.edit_text("💭 Думаю...")
+            except Exception:
+                # Если не удалось отредактировать — отправляем новое
+                status_msg = await first_message.reply("💭 Думаю...")
+            reply_msg = status_msg
 
             # Режим работы: если веб-поиск включён — агентный СТРИМИНГ с tools
             # (финальный ответ стримится, на этапе поиска показывается статус),

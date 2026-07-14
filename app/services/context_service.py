@@ -2,8 +2,9 @@
 Сервис управления контекстом чата: подсчёт токенов, sliding window, сжатие истории.
 """
 
+import json
 import logging
-from typing import Any
+from typing import Any, Callable, Awaitable
 
 from litellm import token_counter
 from sqlalchemy import select
@@ -63,6 +64,16 @@ def build_system_prompt(base_prompt: str | None) -> str:
 _CONTEXT_RESERVE_RATIO = 0.15
 # Абсолютный минимум лимита истории (страховка от абсурдно малых значений).
 _MIN_CONTEXT_LIMIT = 1_000
+
+# Количество последних пар сообщений (user+assistant), сохраняемых несжатыми
+# при LLM-сжатии контекста (оставляет "свежий хвост" для детального контекста).
+_RECENT_PAIRS_TO_KEEP = 10
+
+# Промпт для LLM-сжатия контекста (универсальный, компактный).
+_COMPRESSION_PROMPT = """Сократи эту историю диалога до компактного резюме, сохраняя ключевые факты, выводы, решения и важную контекстную информацию. Убери повторы и избыточные детали. Резюме должно быть понятным для продолжения разговора.
+
+История диалога:
+"""
 
 
 def _effective_context_limit(max_tokens: int | None) -> int:
@@ -152,6 +163,7 @@ async def load_session_history(
     session: AsyncSession,
     chat_session: ChatSession,
     max_tokens: int | None = None,
+    compression_callback: Callable[[str], Awaitable[None]] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Загружает историю сообщений сессии.
@@ -161,6 +173,8 @@ async def load_session_history(
         session: DB сессия
         chat_session: Сессия чата
         max_tokens: Максимальное количество токенов (если None — из settings)
+        compression_callback: Опциональный async callback для показа статуса сжатия
+                              пользователю. Принимает строку статуса.
 
     Returns:
         История в формате [{"role": "system", "content": "..."}, ...]
@@ -211,16 +225,78 @@ async def load_session_history(
     if total_tokens > effective_limit:
         logger.warning(
             f"Session {chat_session.id} exceeds token limit: {total_tokens} > "
-            f"{effective_limit} (max={max_tokens}). Compressing (обрезаем старые сообщения)..."
+            f"{effective_limit} (max={max_tokens}). Compressing..."
         )
         history = await compress_history(
             session=session,
             chat_session=chat_session,
             history=history,
             max_tokens=effective_limit,
+            compression_callback=compression_callback,
         )
 
     return history
+
+
+async def llm_compress_history(
+    chat_session: ChatSession,
+    history_to_compress: list[dict[str, Any]],
+    api_key: str,
+    base_url: str,
+) -> str:
+    """
+    Сжимает историю диалога с помощью LLM (модель пользователя).
+    
+    Отправляет старую часть истории в модель с промптом на сжатие, получает
+    компактное резюме. Используется проактивно при превышении 0.85 лимита.
+
+    Args:
+        chat_session: Сессия чата (для получения модели и эндпоинта)
+        history_to_compress: Список сообщений для сжатия (без system prompt)
+        api_key: API-ключ для эндпоинта пользователя
+        base_url: Base URL эндпоинта
+
+    Returns:
+        Текстовое резюме истории
+
+    Raises:
+        Exception: При любой ошибке запроса к LLM (для обработки откатом)
+    """
+    # Импортируем здесь, чтобы избежать циклических зависимостей
+    from app.services.llm_service import LLMService
+
+    # Формируем JSON-представление истории для промпта
+    history_json = json.dumps(history_to_compress, ensure_ascii=False, indent=2)
+    
+    compression_messages = [
+        {
+            "role": "user",
+            "content": f"{_COMPRESSION_PROMPT}{history_json}"
+        }
+    ]
+
+    # Создаём временный LLM-сервис для запроса сжатия (модель пользователя)
+    model_name = getattr(chat_session, "model_name", None) or chat_session.model
+    llm_service = LLMService(base_url=base_url, api_key=api_key)
+
+    logger.info(
+        f"Requesting LLM compression for session {chat_session.id}, "
+        f"{len(history_to_compress)} messages → summary"
+    )
+
+    # Запрашиваем сжатие (без streaming, с умеренным лимитом токенов)
+    summary = await llm_service.get_completion(
+        model=model_name,
+        messages=compression_messages,
+        max_tokens=4000,  # Разумный лимит для резюме
+    )
+
+    logger.info(
+        f"LLM compression successful for session {chat_session.id}, "
+        f"summary length: {len(summary)} chars"
+    )
+
+    return summary.strip()
 
 
 async def compress_history(
@@ -228,18 +304,24 @@ async def compress_history(
     chat_session: ChatSession,
     history: list[dict[str, Any]],
     max_tokens: int,
+    compression_callback: Callable[[str], Awaitable[None]] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Сжимает историю, если она превышает лимит токенов.
-    Стратегия: удаляем самые старые сообщения, сохраняя system prompt.
-
-    TODO: Для более умного сжатия можно использовать summarization через быструю модель.
+    
+    Стратегия:
+    1. (Новое) Пробует LLM-сжатие: старую часть истории (всё кроме последних ~10 пар
+       сообщений) отправляет в модель пользователя для получения резюме, заменяет
+       старые сообщения одним резюме-сообщением роли assistant.
+    2. При ошибке LLM-сжатия (или если история слишком короткая для сжатия) —
+       откатывается к простой обрезке (удаляет старые сообщения по одному).
 
     Args:
         session: DB сессия
         chat_session: Сессия чата
         history: Текущая история
         max_tokens: Максимальный лимит токенов
+        compression_callback: Опциональный callback для показа статуса сжатия
 
     Returns:
         Сжатая история
@@ -253,7 +335,95 @@ async def compress_history(
         system_prompt = history[0]
         history = history[1:]
 
-    # Удаляем старые сообщения, пока не уложимся в лимит.
+    initial_tokens = count_tokens(
+        token_model,
+        ([system_prompt] if system_prompt else []) + history,
+    )
+
+    # Определяем, есть ли смысл в LLM-сжатии:
+    # - История должна быть достаточно длинной (> 2 * _RECENT_PAIRS_TO_KEEP сообщений)
+    # - Эндпоинт должен быть доступен
+    should_try_llm_compression = (
+        len(history) > 2 * _RECENT_PAIRS_TO_KEEP
+        and chat_session.endpoint_id is not None
+    )
+
+    if should_try_llm_compression:
+        try:
+            # Получаем эндпоинт пользователя для сжатия
+            from app.services.endpoint_service import get_endpoint
+            from app.utils.crypto import decrypt
+
+            endpoint = await get_endpoint(session, chat_session.endpoint_id)
+            if endpoint:
+                api_key = decrypt(endpoint.api_key_encrypted)
+                
+                # Показываем статус пользователю
+                if compression_callback:
+                    await compression_callback("🔄 Контекст сжимается...")
+
+                # Разделяем историю: оставляем последние ~10 пар несжатыми
+                # Считаем пары с конца (user+assistant или просто по очереди)
+                recent_tail = history[-2 * _RECENT_PAIRS_TO_KEEP:]
+                old_part = history[:-2 * _RECENT_PAIRS_TO_KEEP]
+
+                if not old_part:
+                    # Нечего сжимать — весь контент в "свежем хвосте"
+                    raise ValueError("History too short for LLM compression after tail split")
+
+                # Запрашиваем LLM-сжатие старой части
+                summary = await llm_compress_history(
+                    chat_session=chat_session,
+                    history_to_compress=old_part,
+                    api_key=api_key,
+                    base_url=endpoint.base_url,
+                )
+
+                # Заменяем старую часть одним резюме-сообщением роли assistant
+                compressed_history = [
+                    {"role": "assistant", "content": f"[Резюме предыдущего контекста]\n{summary}"}
+                ] + recent_tail
+
+                # Проверяем, что сжатие помогло
+                final_tokens = count_tokens(
+                    token_model,
+                    ([system_prompt] if system_prompt else []) + compressed_history,
+                )
+
+                if final_tokens <= max_tokens:
+                    logger.info(
+                        f"LLM compression successful for session {chat_session.id}: "
+                        f"{initial_tokens} → {final_tokens} tokens"
+                    )
+                    
+                    # Показываем финальный статус
+                    if compression_callback:
+                        await compression_callback(
+                            f"✅ Контекст сжат: {initial_tokens} → {final_tokens} токенов"
+                        )
+
+                    # Возвращаем system prompt + сжатую историю
+                    result = []
+                    if system_prompt:
+                        result.append(system_prompt)
+                    result.extend(compressed_history)
+                    return result
+                else:
+                    logger.warning(
+                        f"LLM compression didn't fit in limit for session {chat_session.id}: "
+                        f"{final_tokens} > {max_tokens}. Falling back to simple truncation."
+                    )
+                    # Откатываемся к простой обрезке (ниже)
+
+        except Exception as e:
+            logger.warning(
+                f"LLM compression failed for session {chat_session.id}: {e}. "
+                f"Falling back to simple truncation."
+            )
+            # Откатываемся к простой обрезке (ниже)
+
+    # Простая обрезка (fallback или если LLM-сжатие не применимо):
+    # удаляем старые сообщения, пока не уложимся в лимит.
     # ВАЖНО: всегда сохраняем хотя бы ПОСЛЕДНЕЕ сообщение (текущий запрос
     # пользователя) — его нельзя выкинуть, даже если оно одно превышает лимит
     # (в этом случае переполнение обработает вызывающий код дружелюбной ошибкой).
@@ -270,14 +440,17 @@ async def compress_history(
         removed = history.pop(0)
         logger.info(f"Removed oldest message from session {chat_session.id}: {removed['role']}")
 
-        # Удаляем из БД (опционально, можно оставить для истории)
-        # В текущей реализации просто не грузим их в memory
-
     # Возвращаем system prompt + оставшуюся историю
     result = []
     if system_prompt:
         result.append(system_prompt)
     result.extend(history)
+
+    final_tokens_fallback = count_tokens(token_model, result)
+    logger.info(
+        f"Simple truncation for session {chat_session.id}: "
+        f"{initial_tokens} → {final_tokens_fallback} tokens"
+    )
 
     return result
 
@@ -360,6 +533,7 @@ async def ensure_context_fits(
     chat_session: ChatSession,
     new_message_content: str,
     max_tokens: int | None = None,
+    compression_callback: Callable[[str], Awaitable[None]] | None = None,
 ) -> bool:
     """
     Проверяет, поместится ли новое сообщение в контекст.
@@ -370,6 +544,7 @@ async def ensure_context_fits(
         chat_session: Сессия чата
         new_message_content: Содержимое нового сообщения пользователя
         max_tokens: Лимит токенов
+        compression_callback: Опциональный callback для показа статуса сжатия
 
     Returns:
         True если всё ок, False если даже после сжатия не помещается
@@ -382,7 +557,9 @@ async def ensure_context_fits(
     token_model = getattr(chat_session, "model_name", None) or chat_session.model
 
     # Загружаем текущую историю (уже обрезанную под effective_limit)
-    history = await load_session_history(session, chat_session, max_tokens)
+    history = await load_session_history(
+        session, chat_session, max_tokens, compression_callback
+    )
 
     # Добавляем новое сообщение
     test_history = history + [{"role": "user", "content": new_message_content}]
@@ -406,6 +583,7 @@ async def ensure_context_fits(
         chat_session=chat_session,
         history=history,
         max_tokens=max(effective_limit - new_msg_tokens, _MIN_CONTEXT_LIMIT),
+        compression_callback=compression_callback,
     )
 
     # Проверяем снова
