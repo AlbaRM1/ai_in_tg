@@ -22,10 +22,10 @@ from app.keyboards.inline import (
 from app.services.endpoint_service import (
     add_endpoint,
     add_favorite_model,
-    delete_endpoint,
-    get_endpoint,
+    delete_owned_endpoint,
     get_favorite_models,
-    get_models_for_endpoint,
+    get_models_for_owned_endpoint,
+    get_owned_endpoint,
     get_user_endpoints,
     is_favorite,
     remove_favorite_model,
@@ -34,6 +34,7 @@ from app.services.endpoint_service import (
 )
 from app.services.user_service import get_user
 from app.states.settings import EndpointStates
+from app.utils.formatting import escape_html
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +123,7 @@ async def callback_endpoints_list(callback: CallbackQuery, session: AsyncSession
 async def callback_endpoint_select(callback: CallbackQuery, session: AsyncSession) -> None:
     """Отображение деталей конкретного эндпоинта"""
     endpoint_id = int(callback.data.split(":")[2])
-    endpoint = await get_endpoint(session, endpoint_id)
+    endpoint = await get_owned_endpoint(session, callback.from_user.id, endpoint_id)
     
     if endpoint is None:
         await callback.answer("❌ Эндпоинт не найден", show_alert=True)
@@ -138,10 +139,10 @@ async def callback_endpoint_select(callback: CallbackQuery, session: AsyncSessio
     active_status = "✅ <b>Активный</b>" if is_active else "❌ Неактивный"
     
     text = (
-        f"🔌 <b>{endpoint.name}</b>\n\n"
+        f"🔌 <b>{escape_html(endpoint.name)}</b>\n\n"
         f"<b>Статус:</b> {active_status}\n"
-        f"<b>URL:</b> <code>{endpoint.base_url}</code>\n"
-        f"<b>API ключ:</b> <code>{masked_key}</code>"
+        f"<b>URL:</b> <code>{escape_html(endpoint.base_url)}</code>\n"
+        f"<b>API ключ:</b> <code>{escape_html(masked_key)}</code>"
     )
     
     try:
@@ -164,10 +165,14 @@ async def callback_endpoint_select(callback: CallbackQuery, session: AsyncSessio
 async def callback_endpoint_activate(callback: CallbackQuery, session: AsyncSession) -> None:
     """Активация эндпоинта"""
     endpoint_id = int(callback.data.split(":")[2])
-    
-    await set_active_endpoint(session, callback.from_user.id, endpoint_id)
+
+    activated = await set_active_endpoint(session, callback.from_user.id, endpoint_id)
+    if not activated:
+        await session.rollback()
+        await callback.answer("❌ Эндпоинт не найден", show_alert=True)
+        return
     await session.commit()
-    
+
     await callback.answer("✅ Эндпоинт активирован")
     logger.info(f"Пользователь {callback.from_user.id} активировал эндпоинт {endpoint_id}")
     
@@ -183,7 +188,7 @@ async def callback_endpoint_activate(callback: CallbackQuery, session: AsyncSess
 async def callback_endpoint_delete(callback: CallbackQuery, session: AsyncSession) -> None:
     """Запрос подтверждения удаления эндпоинта"""
     endpoint_id = int(callback.data.split(":")[2])
-    endpoint = await get_endpoint(session, endpoint_id)
+    endpoint = await get_owned_endpoint(session, callback.from_user.id, endpoint_id)
     
     if endpoint is None:
         await callback.answer("❌ Эндпоинт не найден", show_alert=True)
@@ -191,7 +196,7 @@ async def callback_endpoint_delete(callback: CallbackQuery, session: AsyncSessio
     
     text = (
         f"🗑 <b>Удаление эндпоинта</b>\n\n"
-        f"Вы уверены, что хотите удалить эндпоинт <b>{endpoint.name}</b>?\n\n"
+        f"Вы уверены, что хотите удалить эндпоинт <b>{escape_html(endpoint.name)}</b>?\n\n"
         f"<i>Это действие необратимо. Все избранные модели для этого эндпоинта также будут удалены.</i>"
     )
     
@@ -212,13 +217,15 @@ async def callback_endpoint_delete_confirm(callback: CallbackQuery, session: Asy
     """Подтверждённое удаление эндпоинта"""
     endpoint_id = int(callback.data.split(":")[2])
     
-    success = await delete_endpoint(session, endpoint_id)
-    await session.commit()
-    
+    success = await delete_owned_endpoint(
+        session, callback.from_user.id, endpoint_id
+    )
     if success:
+        await session.commit()
         await callback.answer("✅ Эндпоинт удалён")
         logger.info(f"Пользователь {callback.from_user.id} удалил эндпоинт {endpoint_id}")
     else:
+        await session.rollback()
         await callback.answer("❌ Эндпоинт не найден", show_alert=True)
     
     # Возвращаемся к списку эндпоинтов
@@ -322,8 +329,8 @@ async def process_endpoint_api_key(message: Message, state: FSMContext, session:
     await status_msg.delete()
     await message.answer(
         f"✅ <b>Эндпоинт добавлен!</b>\n\n"
-        f"<b>Название:</b> {name}\n"
-        f"<b>URL:</b> <code>{url}</code>\n"
+        f"<b>Название:</b> {escape_html(name)}\n"
+        f"<b>URL:</b> <code>{escape_html(url)}</code>\n"
         f"<b>Найдено моделей:</b> {len(model_ids)}\n\n"
         f"Теперь вы можете активировать его и выбрать модель.",
         reply_markup=main_settings_keyboard()
@@ -379,7 +386,9 @@ async def callback_models_list_page(
     # Если модели не в кэше или сменился эндпоинт, загружаем заново
     if not models or cached_endpoint_id != user.active_endpoint_id:
         try:
-            models = await get_models_for_endpoint(session, user.active_endpoint_id)
+            models = await get_models_for_owned_endpoint(
+                session, callback.from_user.id, user.active_endpoint_id
+            )
         except Exception as e:
             logger.error(f"Ошибка получения моделей для эндпоинта {user.active_endpoint_id}: {e}")
             await callback.answer(
@@ -404,12 +413,14 @@ async def callback_models_list_page(
     }
     
     # Формируем текст сообщения
-    endpoint = await get_endpoint(session, user.active_endpoint_id)
+    endpoint = await get_owned_endpoint(
+        session, callback.from_user.id, user.active_endpoint_id
+    )
     endpoint_name = endpoint.name if endpoint else "Unknown"
     
     text = (
         f"🤖 <b>Выбор модели</b>\n\n"
-        f"<b>Активный эндпоинт:</b> {endpoint_name}\n"
+        f"<b>Активный эндпоинт:</b> {escape_html(endpoint_name)}\n"
         f"<b>Доступно моделей:</b> {len(models)}"
     )
     
@@ -571,16 +582,23 @@ async def callback_favorite_select(callback: CallbackQuery, session: AsyncSessio
     if favorite is None:
         await callback.answer("❌ Избранная модель не найдена", show_alert=True)
         return
-    
-    # Устанавливаем активный эндпоинт и модель
+
+    # Favorite owner-scoped, но endpoint мог исчезнуть между экранами.
+    endpoint = await get_owned_endpoint(
+        session, callback.from_user.id, favorite.endpoint_id
+    )
+    if endpoint is None:
+        await session.rollback()
+        await callback.answer("❌ Эндпоинт этой модели больше недоступен", show_alert=True)
+        return
+
+    # Устанавливаем активный эндпоинт и модель только после повторной owner-проверки.
     user = await get_user(session, callback.from_user.id)
     user.active_endpoint_id = favorite.endpoint_id
     user.active_model = favorite.model_name
     await session.commit()
-    
-    # Получаем название эндпоинта
-    endpoint = await get_endpoint(session, favorite.endpoint_id)
-    endpoint_name = endpoint.name if endpoint else "Unknown"
+
+    endpoint_name = endpoint.name
     
     await callback.answer(
         f"✅ Активирован эндпоинт \"{endpoint_name}\" и модель \"{favorite.model_name}\""

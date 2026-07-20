@@ -72,6 +72,54 @@ async def get_owned_chat_session_by_topic(
     return OwnedChatSession(chat_session=row[0], endpoint=row[1])
 
 
+async def rebind_owned_chat_session(
+    session: AsyncSession,
+    *,
+    session_id: int,
+    user_id: int,
+    chat_id: int,
+    message_thread_id: int,
+    expected_endpoint_id: int | None,
+    new_endpoint_id: int,
+    model_name: str,
+) -> bool:
+    """CAS-перепривязка endpoint и обоих полей модели одной SQL-операцией.
+
+    Условие включает владельца, координаты Telegram-топика, существование нового
+    owner-scoped endpoint и ожидаемый старый endpoint (включая ``NULL``). Поэтому
+    callback из устаревшего меню не может перезаписать более свежее переключение.
+    Транзакцией и commit/rollback управляет вызывающий код.
+    """
+    endpoint_owned = exists().where(
+        Endpoint.id == new_endpoint_id,
+        Endpoint.user_id == user_id,
+    )
+    expected_endpoint_clause = (
+        ChatSession.endpoint_id.is_(None)
+        if expected_endpoint_id is None
+        else ChatSession.endpoint_id == expected_endpoint_id
+    )
+    result = await session.execute(
+        update(ChatSession)
+        .where(
+            ChatSession.id == session_id,
+            ChatSession.user_id == user_id,
+            ChatSession.chat_id == chat_id,
+            ChatSession.message_thread_id == message_thread_id,
+            expected_endpoint_clause,
+            endpoint_owned,
+        )
+        .values(
+            endpoint_id=new_endpoint_id,
+            model_name=model_name,
+            model=model_name,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    await session.flush()
+    return result.rowcount == 1
+
+
 async def update_owned_chat_session_model(
     session: AsyncSession,
     *,

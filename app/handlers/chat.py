@@ -19,10 +19,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.base import async_session_factory
 from app.database.models import ChatSession, User
 from app.keyboards.inline import (
+    session_endpoint_fetch_failed_keyboard,
+    session_endpoints_keyboard,
     session_favorite_models_keyboard,
     session_model_digest,
     session_model_menu_keyboard,
+    session_models_fetch_failed_keyboard,
     session_models_list_keyboard,
+    session_rebind_models_keyboard,
 )
 from app.services.attachment_service import (
     build_text_part,
@@ -36,13 +40,15 @@ from app.services.context_service import (
 )
 from app.services.endpoint_service import (
     get_favorite_models,
-    get_owned_endpoint,
     get_models_for_owned_endpoint,
+    get_owned_endpoint,
+    get_user_endpoints,
 )
 from app.services.chat_session_service import (
     OwnedChatSession,
     get_owned_chat_session,
     get_owned_chat_session_by_topic,
+    rebind_owned_chat_session,
     update_owned_chat_session_model,
 )
 from app.services.llm_service import LLMService
@@ -273,24 +279,21 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
                         chat_session.id,
                     )
                     await first_message.reply(
-                        "❌ Endpoint этого топика удалён или недоступен. "
-                        "История сохранена, но продолжить эту сессию нельзя."
+                        "❌ Endpoint этого топика удалён или недоступен. История сохранена. "
+                        "Используйте /model в этом топике, чтобы выбрать новый endpoint "
+                        "и совместимую модель."
                     )
                     return
             else:
-                if not user.active_endpoint_id:
-                    await first_message.reply(
-                        "⚠️ Сначала настройте эндпоинт через /settings в личке с ботом."
-                    )
-                    return
-                endpoint = await get_owned_endpoint(
-                    session, user.telegram_id, user.active_endpoint_id
+                # NULL означает удалённую/непривязанную пару сессии. Глобально
+                # активный endpoint показывается в /model только как вариант и не
+                # должен применяться неявно: модель принадлежит прежнему endpoint.
+                await first_message.reply(
+                    "❌ Endpoint этого топика удалён или не выбран. История сохранена. "
+                    "Используйте /model в этом топике, чтобы явно выбрать новый "
+                    "endpoint и совместимую модель."
                 )
-                if not endpoint:
-                    await first_message.reply(
-                        "❌ Активный эндпоинт не найден. Настройте через /settings"
-                    )
-                    return
+                return
 
             api_key = decrypt(endpoint.api_key_encrypted)
 
@@ -870,6 +873,8 @@ async def _load_callback_session(
     callback: CallbackQuery,
     session: AsyncSession,
     session_id: int,
+    *,
+    allow_missing_endpoint: bool = False,
 ) -> OwnedChatSession | None:
     """Строго связывает callback с владельцем, чатом и forum topic сообщения."""
     message = callback.message
@@ -889,9 +894,21 @@ async def _load_callback_session(
     if owned is None:
         await callback.answer("❌ Сессия не найдена или доступ запрещён", show_alert=True)
         return None
-    if owned.endpoint is None:
+    if owned.endpoint is None and not allow_missing_endpoint:
+        text, keyboard = await _session_endpoints_view(session, owned)
+        try:
+            await callback.message.edit_text(
+                text, reply_markup=keyboard, parse_mode="HTML"
+            )
+        except Exception as error:
+            logger.warning(
+                "Endpoint сессии %s исчез, recovery UI не обновлён: %s",
+                session_id,
+                type(error).__name__,
+            )
         await callback.answer(
-            "❌ Endpoint этой сессии удалён или недоступен", show_alert=True
+            "❌ Endpoint удалён. История сохранена; выберите другой endpoint.",
+            show_alert=True,
         )
         return None
     return owned
@@ -909,6 +926,77 @@ async def _available_session_models(
         owned.endpoint.id,
     )
     return list(dict.fromkeys(models))
+
+
+def _parse_callback_id(raw: str) -> int:
+    """Разбирает положительный lowercase base36 ID из callback_data."""
+    if not raw or any(char not in "0123456789abcdefghijklmnopqrstuvwxyz" for char in raw):
+        raise ValueError
+    value = int(raw, 36)
+    if value < 1:
+        raise ValueError
+    return value
+
+
+def _parse_expected_endpoint(raw: str) -> int | None:
+    """Разбирает base36 CAS-токен старого endpoint из callback."""
+    return None if raw == "n" else _parse_callback_id(raw)
+
+
+async def _session_endpoints_view(
+    session: AsyncSession,
+    owned: OwnedChatSession,
+) -> tuple[str, object]:
+    """Строит recovery/смену endpoint только из endpoint-ов владельца."""
+    endpoints = await get_user_endpoints(session, owned.chat_session.user_id)
+    user = await get_user(session, owned.chat_session.user_id)
+    current_model = owned.chat_session.model_name or owned.chat_session.model
+    if owned.endpoint is None:
+        heading = (
+            "❌ <b>Endpoint этой сессии удалён</b>\n\n"
+            "История диалога и прежнее имя модели сохранены."
+        )
+    else:
+        heading = (
+            "🔌 <b>Смена endpoint текущего топика</b>\n\n"
+            f"Текущий endpoint: <b>{escape_html(owned.endpoint.name)}</b>"
+        )
+    # В явном flow смены текущий endpoint не предлагаем как "новый": это делает
+    # CAS одноразовым и не позволяет повторному callback повторить запись.
+    selectable_endpoints = (
+        endpoints
+        if owned.chat_session.endpoint_id is None
+        else [
+            endpoint for endpoint in endpoints
+            if endpoint.id != owned.chat_session.endpoint_id
+        ]
+    )
+    if selectable_endpoints:
+        text = (
+            f"{heading}\n"
+            f"Текущая модель: <code>{escape_html(current_model)}</code>\n\n"
+            "Выберите endpoint. ✅ отмечен глобально активный endpoint. "
+            "Глобальные настройки и история изменены не будут."
+        )
+    else:
+        text = (
+            f"{heading}\n"
+            f"Текущая модель: <code>{escape_html(current_model)}</code>\n\n"
+            + (
+                "У вас нет доступных endpoint. Добавьте endpoint в личном чате с ботом: "
+                "/settings → «Мои эндпоинты» → «Добавить эндпоинт»."
+                if owned.chat_session.endpoint_id is None
+                else "Других доступных endpoint у вас нет. Добавить endpoint можно в "
+                "личном чате: /settings → «Мои эндпоинты» → «Добавить эндпоинт»."
+            )
+        )
+    keyboard = session_endpoints_keyboard(
+        owned.chat_session.id,
+        owned.chat_session.endpoint_id,
+        selectable_endpoints,
+        user.active_endpoint_id if user else None,
+    )
+    return text, keyboard
 
 
 async def _show_session_favorites(
@@ -963,9 +1051,8 @@ async def cmd_session_model(message: Message, session: AsyncSession) -> None:
         )
         return
     if owned.endpoint is None:
-        await message.answer(
-            "❌ Endpoint этой сессии удалён или недоступен. История топика сохранена."
-        )
+        text, keyboard = await _session_endpoints_view(session, owned)
+        await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
         return
 
     try:
@@ -982,9 +1069,16 @@ async def cmd_session_model(message: Message, session: AsyncSession) -> None:
         logger.warning(
             "Не удалось получить модели endpoint %s для /model: %s",
             owned.endpoint.id,
-            error,
+            type(error).__name__,
         )
-        await message.answer("❌ Не удалось получить актуальный список моделей endpoint.")
+        await message.answer(
+            "⚠️ <b>Endpoint существует, но список моделей сейчас недоступен.</b>\n\n"
+            "Данные сессии не изменены. Можно повторить запрос или выбрать другой endpoint.",
+            reply_markup=session_models_fetch_failed_keyboard(
+                owned.chat_session.id,
+            ),
+            parse_mode="HTML",
+        )
         return
 
     current_model = owned.chat_session.model_name or owned.chat_session.model
@@ -1002,6 +1096,235 @@ async def cmd_session_model(message: Message, session: AsyncSession) -> None:
         ),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data.regexp(r"^se:e:[0-9]+$"))
+async def callback_session_endpoints(
+    callback: CallbackQuery, session: AsyncSession
+) -> None:
+    """Показывает актуальные owner-scoped endpoint-ы для recovery/смены."""
+    try:
+        session_id = int(callback.data.split(":")[2])
+    except (AttributeError, IndexError, ValueError):
+        await callback.answer("❌ Некорректное меню", show_alert=True)
+        return
+    owned = await _load_callback_session(
+        callback, session, session_id, allow_missing_endpoint=True
+    )
+    if owned is None:
+        return
+    text, keyboard = await _session_endpoints_view(session, owned)
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^se:p:[0-9a-z]+:(n|[0-9a-z]+):[0-9a-z]+:[0-9]+$"))
+async def callback_session_endpoint_models(
+    callback: CallbackQuery, session: AsyncSession
+) -> None:
+    """Получает свежие модели выбранного endpoint и показывает страницу."""
+    try:
+        _, _, session_raw, old_raw, endpoint_raw, page_raw = callback.data.split(":")
+        session_id = _parse_callback_id(session_raw)
+        expected_endpoint_id = _parse_expected_endpoint(old_raw)
+        endpoint_id = _parse_callback_id(endpoint_raw)
+        page = int(page_raw)
+        if endpoint_id < 1 or page < 0:
+            raise ValueError
+    except (AttributeError, ValueError):
+        await callback.answer("❌ Некорректный выбор endpoint", show_alert=True)
+        return
+    owned = await _load_callback_session(
+        callback, session, session_id, allow_missing_endpoint=True
+    )
+    if owned is None:
+        return
+    if owned.chat_session.endpoint_id != expected_endpoint_id:
+        await callback.answer("❌ Меню устарело: сессия уже изменилась", show_alert=True)
+        return
+    endpoint = await get_owned_endpoint(session, callback.from_user.id, endpoint_id)
+    if endpoint is None:
+        await callback.answer(
+            "❌ Endpoint удалён или больше недоступен. Выберите актуальный.",
+            show_alert=True,
+        )
+        text, keyboard = await _session_endpoints_view(session, owned)
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+        return
+    try:
+        models = list(dict.fromkeys(await get_models_for_owned_endpoint(
+            session, callback.from_user.id, endpoint_id
+        )))
+    except Exception as error:
+        logger.warning(
+            "Не удалось получить модели endpoint %s для смены сессии %s: %s",
+            endpoint_id, session_id, type(error).__name__,
+        )
+        await callback.message.edit_text(
+            "⚠️ <b>Endpoint существует, но список моделей сейчас недоступен.</b>\n\n"
+            "Сессия и история не изменены.",
+            reply_markup=session_endpoint_fetch_failed_keyboard(
+                session_id, expected_endpoint_id, endpoint_id
+            ),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+    if not models:
+        await callback.message.edit_text(
+            "⚠️ <b>Endpoint существует, но не вернул доступных моделей.</b>\n\n"
+            "Сессия и история не изменены.",
+            reply_markup=session_endpoint_fetch_failed_keyboard(
+                session_id, expected_endpoint_id, endpoint_id
+            ),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+    max_page = (len(models) - 1) // 8
+    if page > max_page:
+        await callback.answer("❌ Страница устарела; список обновлён", show_alert=True)
+        page = 0
+    favorites = await get_favorite_models(session, callback.from_user.id)
+    favorite_names = {
+        favorite.model_name for favorite in favorites
+        if favorite.endpoint_id == endpoint_id
+    }
+    await callback.message.edit_text(
+        "🔌 <b>Выбран новый endpoint:</b> "
+        f"{escape_html(endpoint.name)}\n\n"
+        "Выберите модель. Нажатие модели одновременно сменит endpoint и модель "
+        "только для текущего топика; история сохранится.\n\n"
+        f"📋 Страница {page + 1}/{max_page + 1}",
+        reply_markup=session_rebind_models_keyboard(
+            session_id, expected_endpoint_id, endpoint_id, models, favorite_names, page
+        ),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(
+    F.data.regexp(r"^se:s:[0-9a-z]+:(n|[0-9a-z]+):[0-9a-z]+:[0-9a-f]{12}$")
+)
+async def callback_session_endpoint_model_select(
+    callback: CallbackQuery, session: AsyncSession
+) -> None:
+    """Разрешает digest по свежему списку и CAS-перепривязывает сессию."""
+    try:
+        _, _, session_raw, old_raw, endpoint_raw, digest = callback.data.split(":")
+        session_id = _parse_callback_id(session_raw)
+        expected_endpoint_id = _parse_expected_endpoint(old_raw)
+        endpoint_id = _parse_callback_id(endpoint_raw)
+        if len(digest) != 12:
+            raise ValueError
+    except (AttributeError, ValueError):
+        await callback.answer("❌ Некорректный выбор модели", show_alert=True)
+        return
+    owned = await _load_callback_session(
+        callback, session, session_id, allow_missing_endpoint=True
+    )
+    if owned is None:
+        return
+    if owned.chat_session.endpoint_id != expected_endpoint_id:
+        await callback.answer("❌ Меню устарело: сессия уже изменилась", show_alert=True)
+        return
+    endpoint = await get_owned_endpoint(session, callback.from_user.id, endpoint_id)
+    if endpoint is None:
+        await callback.answer("❌ Endpoint исчез. Выберите другой.", show_alert=True)
+        text, keyboard = await _session_endpoints_view(session, owned)
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+        return
+    try:
+        models = list(dict.fromkeys(await get_models_for_owned_endpoint(
+            session, callback.from_user.id, endpoint_id
+        )))
+    except Exception as error:
+        logger.warning(
+            "Не удалось повторно получить модели endpoint %s сессии %s: %s",
+            endpoint_id, session_id, type(error).__name__,
+        )
+        await callback.answer("❌ Список моделей недоступен; запись не изменена", show_alert=True)
+        return
+    matches = [model for model in models if session_model_digest(model) == digest]
+    if len(matches) != 1:
+        logger.warning(
+            "Digest модели не разрешён однозначно при rebind сессии %s: matches=%s",
+            session_id, len(matches),
+        )
+        await callback.answer(
+            "❌ Модель исчезла или идентификатор неоднозначен. Обновите список.",
+            show_alert=True,
+        )
+        return
+    new_model = matches[0]
+    updated = await rebind_owned_chat_session(
+        session,
+        session_id=session_id,
+        user_id=callback.from_user.id,
+        chat_id=callback.message.chat.id,
+        message_thread_id=callback.message.message_thread_id,
+        expected_endpoint_id=expected_endpoint_id,
+        new_endpoint_id=endpoint_id,
+        model_name=new_model,
+    )
+    if not updated:
+        await session.rollback()
+        await callback.answer(
+            "❌ Сессия или endpoint изменились. Откройте /model заново.",
+            show_alert=True,
+        )
+        return
+    await session.commit()
+    logger.info(
+        "Пользователь %s перепривязал сессию %s к endpoint %s и новой модели",
+        callback.from_user.id, session_id, endpoint_id,
+    )
+    try:
+        await callback.message.edit_text(
+            "✅ <b>Endpoint и модель текущего топика изменены</b>\n\n"
+            f"<b>Endpoint:</b> {escape_html(endpoint.name)}\n"
+            f"<b>Модель:</b> <code>{escape_html(new_model)}</code>\n\n"
+            "История сохранена. Глобальные настройки не изменены.",
+            reply_markup=session_model_menu_keyboard(session_id),
+            parse_mode="HTML",
+        )
+    except Exception as error:
+        logger.warning(
+            "Перепривязка сессии %s сохранена, но Telegram UI не обновлён: %s",
+            session_id, type(error).__name__,
+        )
+        try:
+            await callback.answer(
+                "✅ Endpoint и модель сохранены, но меню не обновилось", show_alert=True
+            )
+        except Exception:
+            pass
+        return
+    await callback.answer("✅ Endpoint и модель изменены")
+
+
+@router.callback_query(F.data.regexp(r"^se:n:[0-9a-z]+:(n|[0-9a-z]+)$"))
+async def callback_session_endpoint_noop(
+    callback: CallbackQuery, session: AsyncSession
+) -> None:
+    """Без изменений подтверждает актуальность rebind-меню для page indicator."""
+    try:
+        _, _, session_raw, old_raw = callback.data.split(":")
+        session_id = _parse_callback_id(session_raw)
+        expected_endpoint_id = _parse_expected_endpoint(old_raw)
+    except (AttributeError, ValueError):
+        await callback.answer("❌ Некорректное меню", show_alert=True)
+        return
+    owned = await _load_callback_session(
+        callback, session, session_id, allow_missing_endpoint=True
+    )
+    if owned is None:
+        return
+    if owned.chat_session.endpoint_id != expected_endpoint_id:
+        await callback.answer("❌ Меню устарело: сессия уже изменилась", show_alert=True)
+        return
+    await callback.answer()
 
 
 @router.callback_query(F.data.regexp(r"^sm:m:[0-9]+$"))
@@ -1211,7 +1534,9 @@ async def callback_session_model_close(
     except (AttributeError, IndexError, ValueError):
         await callback.answer("❌ Некорректное меню", show_alert=True)
         return
-    owned = await _load_callback_session(callback, session, session_id)
+    owned = await _load_callback_session(
+        callback, session, session_id, allow_missing_endpoint=True
+    )
     if owned is None:
         return
     try:

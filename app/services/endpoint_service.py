@@ -7,7 +7,7 @@ import logging
 from typing import Any
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import Endpoint, FavoriteModel, User
@@ -110,25 +110,47 @@ async def delete_endpoint(session: AsyncSession, endpoint_id: int) -> bool:
     return True
 
 
-async def set_active_endpoint(session: AsyncSession, user_id: int, endpoint_id: int) -> None:
-    """
-    Устанавливает активный эндпоинт для пользователя.
-
-    Args:
-        session: Сессия БД
-        user_id: ID пользователя
-        endpoint_id: ID эндпоинта для активации
-    """
-    result = await session.execute(select(User).where(User.telegram_id == user_id))
-    user = result.scalar_one_or_none()
-
-    if user is None:
-        logger.error(f"Пользователь {user_id} не найден при установке активного эндпоинта")
-        raise ValueError(f"Пользователь {user_id} не найден")
-
-    user.active_endpoint_id = endpoint_id
+async def delete_owned_endpoint(
+    session: AsyncSession, user_id: int, endpoint_id: int
+) -> bool:
+    """Удаляет endpoint только у указанного владельца."""
+    result = await session.execute(
+        delete(Endpoint).where(
+            Endpoint.id == endpoint_id,
+            Endpoint.user_id == user_id,
+        )
+    )
     await session.flush()
-    logger.info(f"Для пользователя {user_id} установлен активный эндпоинт {endpoint_id}")
+    deleted = result.rowcount == 1
+    if deleted:
+        logger.info("Пользователь %s удалил endpoint %s", user_id, endpoint_id)
+    return deleted
+
+
+async def set_active_endpoint(session: AsyncSession, user_id: int, endpoint_id: int) -> bool:
+    """Одним SQL-запросом активирует только owner-scoped endpoint."""
+    endpoint_owned = select(Endpoint.id).where(
+        Endpoint.id == endpoint_id,
+        Endpoint.user_id == user_id,
+    ).exists()
+    result = await session.execute(
+        update(User)
+        .where(
+            User.telegram_id == user_id,
+            endpoint_owned,
+        )
+        .values(active_endpoint_id=endpoint_id)
+        .execution_options(synchronize_session=False)
+    )
+    await session.flush()
+    activated = result.rowcount == 1
+    if activated:
+        logger.info(
+            "Для пользователя %s установлен активный endpoint %s",
+            user_id,
+            endpoint_id,
+        )
+    return activated
 
 
 async def validate_endpoint(base_url: str, api_key: str) -> tuple[bool, str, list[str]]:

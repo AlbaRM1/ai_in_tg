@@ -731,15 +731,23 @@ async def fetch_available_models(base_url: str, api_key: str, timeout: int = 30)
             elif isinstance(data, list):
                 return data
             else:
-                logger.warning(f"Unexpected models response format: {data}")
+                logger.warning("Unexpected models response format (payload omitted)")
                 return []
 
         except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error fetching models: {e.response.status_code} - {e.response.text}")
+            # Не логируем URL, заголовки или response body: они могут содержать
+            # credentials либо чувствительные данные провайдера.
+            logger.error(
+                "HTTP error fetching models: status=%s",
+                e.response.status_code,
+            )
             raise
         except httpx.TimeoutException:
-            logger.error(f"Timeout fetching models from {url}")
+            logger.error("Timeout fetching models")
             raise
         except Exception as e:
-            logger.error(f"Error fetching models: {e}", exc_info=True)
+            logger.error(
+                "Error fetching models: type=%s",
+                type(e).__name__,
+            )
             raise

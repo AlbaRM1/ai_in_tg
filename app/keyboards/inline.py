@@ -225,6 +225,77 @@ def session_model_menu_keyboard(session_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="⭐ Избранные", callback_data=f"sm:f:{session_id}")
     builder.button(text="📋 Все модели", callback_data=f"sm:l:{session_id}:0")
+    builder.button(text="🔌 Сменить endpoint", callback_data=f"se:e:{session_id}")
+    builder.button(text="❌ Закрыть", callback_data=f"sm:x:{session_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def session_integer_token(value: int) -> str:
+    """Компактно кодирует положительный ID в base36 для callback_data Telegram."""
+    if value < 1:
+        raise ValueError("ID must be positive")
+    alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+    encoded = ""
+    while value:
+        value, remainder = divmod(value, 36)
+        encoded = alphabet[remainder] + encoded
+    return encoded
+
+
+def session_endpoint_token(endpoint_id: int | None) -> str:
+    """Кодирует ожидаемый endpoint в base36; ``n`` означает SQL NULL."""
+    return "n" if endpoint_id is None else session_integer_token(endpoint_id)
+
+
+def session_endpoints_keyboard(
+    session_id: int,
+    expected_endpoint_id: int | None,
+    endpoints: list,
+    active_endpoint_id: int | None,
+) -> InlineKeyboardMarkup:
+    """Owner-scoped endpoint-ы для recovery/явной перепривязки с CAS-токеном."""
+    builder = InlineKeyboardBuilder()
+    session_token = session_integer_token(session_id)
+    old = session_endpoint_token(expected_endpoint_id)
+    for endpoint in endpoints:
+        prefix = "✅ " if endpoint.id == active_endpoint_id else ""
+        display_name = endpoint.name if len(endpoint.name) <= 40 else endpoint.name[:37] + "..."
+        endpoint_token = session_integer_token(endpoint.id)
+        builder.button(
+            text=f"{prefix}{display_name}",
+            callback_data=f"se:p:{session_token}:{old}:{endpoint_token}:0",
+        )
+    builder.button(text="❌ Закрыть", callback_data=f"sm:x:{session_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def session_models_fetch_failed_keyboard(session_id: int) -> InlineKeyboardMarkup:
+    """Повтор текущего /model без превращения его в flow перепривязки."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔄 Повторить", callback_data=f"sm:f:{session_id}")
+    builder.button(text="🔌 Выбрать другой endpoint", callback_data=f"se:e:{session_id}")
+    builder.button(text="❌ Закрыть", callback_data=f"sm:x:{session_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def session_endpoint_fetch_failed_keyboard(
+    session_id: int,
+    expected_endpoint_id: int | None,
+    endpoint_id: int,
+) -> InlineKeyboardMarkup:
+    """Безопасные действия при временной ошибке получения моделей."""
+    session_token = session_integer_token(session_id)
+    old = session_endpoint_token(expected_endpoint_id)
+    endpoint_token = session_integer_token(endpoint_id)
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="🔄 Повторить",
+        callback_data=f"se:p:{session_token}:{old}:{endpoint_token}:0",
+    )
+    builder.button(text="🔌 Выбрать другой endpoint", callback_data=f"se:e:{session_id}")
     builder.button(text="❌ Закрыть", callback_data=f"sm:x:{session_id}")
     builder.adjust(1)
     return builder.as_markup()
@@ -247,6 +318,7 @@ def session_favorite_models_keyboard(
             ),
         )
     builder.button(text="📋 Все модели", callback_data=f"sm:l:{session_id}:0")
+    builder.button(text="🔌 Сменить endpoint", callback_data=f"se:e:{session_id}")
     builder.button(text="⬅️ Назад", callback_data=f"sm:m:{session_id}")
     builder.button(text="❌ Закрыть", callback_data=f"sm:x:{session_id}")
     builder.adjust(1)
@@ -288,12 +360,69 @@ def session_models_list_keyboard(
             nav_count += 1
 
     builder.button(text="⭐ Избранные", callback_data=f"sm:f:{session_id}")
+    builder.button(text="🔌 Сменить endpoint", callback_data=f"se:e:{session_id}")
     builder.button(text="⬅️ В меню", callback_data=f"sm:m:{session_id}")
     builder.button(text="❌ Закрыть", callback_data=f"sm:x:{session_id}")
     pattern = [1] * len(page_models)
     if nav_count:
         pattern.append(nav_count)
-    pattern.extend([1, 1, 1])
+    pattern.extend([1, 1, 1, 1])
+    builder.adjust(*pattern)
+    return builder.as_markup()
+
+
+def session_rebind_models_keyboard(
+    session_id: int,
+    expected_endpoint_id: int | None,
+    endpoint_id: int,
+    models: list[str],
+    favorites: set[str],
+    page: int = 0,
+    page_size: int = 8,
+) -> InlineKeyboardMarkup:
+    """Модели выбранного endpoint; полное имя заменено digest в callback."""
+    builder = InlineKeyboardBuilder()
+    session_token = session_integer_token(session_id)
+    old = session_endpoint_token(expected_endpoint_id)
+    endpoint_token = session_integer_token(endpoint_id)
+    total_pages = max(1, (len(models) + page_size - 1) // page_size)
+    page = min(max(page, 0), total_pages - 1)
+    page_models = models[page * page_size:(page + 1) * page_size]
+    for model_name in page_models:
+        display_name = model_name if len(model_name) <= 40 else model_name[:37] + "..."
+        prefix = "⭐ " if model_name in favorites else ""
+        builder.button(
+            text=f"{prefix}{display_name}",
+            callback_data=(
+                f"se:s:{session_token}:{old}:{endpoint_token}:"
+                f"{session_model_digest(model_name)}"
+            ),
+        )
+    nav_count = 0
+    if total_pages > 1:
+        if page > 0:
+            builder.button(
+                text="⬅️",
+                callback_data=f"se:p:{session_token}:{old}:{endpoint_token}:{page - 1}",
+            )
+            nav_count += 1
+        builder.button(
+            text=f"{page + 1}/{total_pages}",
+            callback_data=f"se:n:{session_token}:{old}",
+        )
+        nav_count += 1
+        if page < total_pages - 1:
+            builder.button(
+                text="➡️",
+                callback_data=f"se:p:{session_token}:{old}:{endpoint_token}:{page + 1}",
+            )
+            nav_count += 1
+    builder.button(text="⬅️ К endpoint-ам", callback_data=f"se:e:{session_id}")
+    builder.button(text="❌ Закрыть", callback_data=f"sm:x:{session_id}")
+    pattern = [1] * len(page_models)
+    if nav_count:
+        pattern.append(nav_count)
+    pattern.extend([1, 1])
     builder.adjust(*pattern)
     return builder.as_markup()
 
