@@ -4,6 +4,7 @@
 
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any, Callable, Awaitable
 
 from litellm import token_counter
@@ -12,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database.models import ChatSession, Message
+from app.services.runtime_context import with_runtime_context, without_runtime_context
 from app.services.web_search import is_web_search_enabled
 
 logger = logging.getLogger(__name__)
@@ -84,11 +86,14 @@ _MAX_MESSAGES_PER_COMPRESSION_BATCH = 80
 # При каждой итерации сжимается батч из _MAX_MESSAGES_PER_COMPRESSION_BATCH сообщений.
 _MAX_COMPRESSION_ITERATIONS = 5
 
-# Промпт для LLM-сжатия контекста (универсальный, компактный).
-_COMPRESSION_PROMPT = """Сократи эту историю диалога до компактного резюме, сохраняя ключевые факты, выводы, решения и важную контекстную информацию. Убери повторы и избыточные детали. Резюме должно быть понятным для продолжения разговора.
-
-История диалога:
-"""
+# Системная инструкция для LLM-сжатия. Runtime datetime добавляется отдельным
+# блоком на LLM boundary и не должен попадать в резюме.
+_COMPRESSION_SYSTEM_PROMPT = (
+    "Сократи переданную историю диалога до компактного резюме, сохраняя ключевые "
+    "факты, выводы, решения и важную контекстную информацию. Убери повторы и "
+    "избыточные детали. Резюме должно быть понятным для продолжения разговора. "
+    "Не включай в резюме служебный runtime-контекст с текущими датой и временем."
+)
 
 
 def _effective_context_limit(max_tokens: int | None) -> int:
@@ -239,6 +244,11 @@ async def load_session_history(
             # Иначе используем обычное текстовое поле
             history.append({"role": msg.role, "content": msg.content})
 
+    # Добавляем динамический runtime context до подсчёта токенов, чтобы его размер
+    # учитывался sliding window. Низкоуровневый LLM boundary перед сетью безопасно
+    # обновит этот блок ещё раз, не мутируя список и не создавая дубликатов.
+    history = with_runtime_context(history)
+
     # Проверяем, не превышаем ли лимит токенов (с учётом резерва под ответ)
     total_tokens = count_tokens(token_model, history)
 
@@ -285,14 +295,14 @@ async def llm_compress_history(
     # Импортируем здесь, чтобы избежать циклических зависимостей
     from app.services.llm_service import LLMService
 
-    # Формируем JSON-представление истории для промпта
-    history_json = json.dumps(history_to_compress, ensure_ascii=False, indent=2)
-    
+    # Защитно удаляем runtime-блок перед сериализацией: он не является историей
+    # пользователя, не должен влиять на summary и никогда не должен попасть в БД.
+    clean_history = without_runtime_context(history_to_compress)
+    history_json = json.dumps(clean_history, ensure_ascii=False, indent=2)
+
     compression_messages = [
-        {
-            "role": "user",
-            "content": f"{_COMPRESSION_PROMPT}{history_json}"
-        }
+        {"role": "system", "content": _COMPRESSION_SYSTEM_PROMPT},
+        {"role": "user", "content": f"История диалога:\n{history_json}"},
     ]
 
     # Создаём временный LLM-сервис для запроса сжатия (модель пользователя)

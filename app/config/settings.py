@@ -28,6 +28,15 @@ class Settings(BaseSettings):
         description="Ключ шифрования API-ключей (base64, 32 байта для Fernet). Пока не используется — заглушки.",
     )
 
+    # Application timezone
+    APP_TIMEZONE: str = Field(
+        default="Asia/Yekaterinburg",
+        description=(
+            "IANA-имя часового пояса для динамического времени в LLM-запросах. "
+            "При невалидном значении используется UTC."
+        ),
+    )
+
     # Context Management
     MAX_CONTEXT_TOKENS: int = Field(
         default=100_000,

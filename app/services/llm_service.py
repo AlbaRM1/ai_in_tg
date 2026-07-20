@@ -14,6 +14,7 @@ import httpx
 from litellm import acompletion
 
 from app.config import settings
+from app.services.runtime_context import with_runtime_context
 
 from app.services.web_search import (
     WEB_SEARCH_TOOL,
@@ -146,7 +147,7 @@ class LLMService:
 
             kwargs: dict[str, Any] = dict(
                 model=normalized_model,
-                messages=messages,
+                messages=with_runtime_context(messages),
                 api_base=self.base_url,
                 api_key=self.api_key,
                 stream=True,
@@ -201,7 +202,7 @@ class LLMService:
 
             kwargs: dict[str, Any] = dict(
                 model=normalized_model,
-                messages=messages,
+                messages=with_runtime_context(messages),
                 api_base=self.base_url,
                 api_key=self.api_key,
                 stream=False,
@@ -246,7 +247,7 @@ class LLMService:
         """
         kwargs: dict[str, Any] = dict(
             model=model,
-            messages=messages,
+            messages=with_runtime_context(messages),
             api_base=self.base_url,
             api_key=self.api_key,
             stream=False,
@@ -285,7 +286,7 @@ class LLMService:
         """
         kwargs: dict[str, Any] = dict(
             model=model,
-            messages=messages,
+            messages=with_runtime_context(messages),
             api_base=self.base_url,
             api_key=self.api_key,
             stream=True,
