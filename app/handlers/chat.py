@@ -9,7 +9,8 @@ import asyncio
 import logging
 
 from aiogram import Bot, F, Router
-from aiogram.types import Message
+from aiogram.filters import Command
+from aiogram.types import CallbackQuery, Message
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest, TelegramForbiddenError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -17,6 +18,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.base import async_session_factory
 from app.database.models import ChatSession, User
+from app.keyboards.inline import (
+    session_favorite_models_keyboard,
+    session_model_digest,
+    session_model_menu_keyboard,
+    session_models_list_keyboard,
+)
 from app.services.attachment_service import (
     build_text_part,
     process_document,
@@ -27,7 +34,17 @@ from app.services.context_service import (
     ensure_context_fits,
     load_session_history,
 )
-from app.services.endpoint_service import get_endpoint
+from app.services.endpoint_service import (
+    get_favorite_models,
+    get_owned_endpoint,
+    get_models_for_owned_endpoint,
+)
+from app.services.chat_session_service import (
+    OwnedChatSession,
+    get_owned_chat_session,
+    get_owned_chat_session_by_topic,
+    update_owned_chat_session_model,
+)
 from app.services.llm_service import LLMService
 
 try:
@@ -202,6 +219,22 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
                 active_model=user.active_model,
             )
             
+            # Уникальность сессии задана координатами топика, поэтому существующая
+            # запись может принадлежать только первоначальному владельцу сессии.
+            # Другой участник группового топика не должен читать/изменять её.
+            if chat_session.user_id != user.telegram_id:
+                logger.warning(
+                    "Пользователь %s попытался использовать сессию %s владельца %s",
+                    user.telegram_id,
+                    chat_session.id,
+                    chat_session.user_id,
+                )
+                await first_message.reply(
+                    "❌ Сессия этого топика принадлежит другому пользователю. "
+                    "Доступ к её модели и истории запрещён."
+                )
+                return
+
             # 3. Определяем модель и эндпоинт для использования
             if chat_session.model_name:
                 session_model = chat_session.model_name
@@ -217,8 +250,9 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
                 session_model = user.active_model
                 session_endpoint_id = user.active_endpoint_id
                 
-                # Фиксируем за сессией
+                # Фиксируем за сессией оба поля модели для обратной совместимости.
                 chat_session.model_name = session_model
+                chat_session.model = session_model
                 chat_session.endpoint_id = session_endpoint_id
                 await session.flush()
                 is_new_session = True
@@ -229,36 +263,29 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
             
             # 4. Получаем эндпоинт
             if session_endpoint_id:
-                endpoint = await get_endpoint(session, session_endpoint_id)
+                endpoint = await get_owned_endpoint(
+                    session, user.telegram_id, session_endpoint_id
+                )
                 if not endpoint:
                     logger.warning(
-                        f"Зафиксированный эндпоинт {session_endpoint_id} для сессии "
-                        f"{chat_session.id} не найден. Переключение на активный эндпоинт пользователя."
+                        "Зафиксированный endpoint %s сессии %s удалён или не принадлежит владельцу",
+                        session_endpoint_id,
+                        chat_session.id,
                     )
-                    
-                    if not user.active_endpoint_id:
-                        await first_message.reply(
-                            "❌ Эндпоинт этого чата был удалён, и у вас нет активного эндпоинта. "
-                            "Настройте эндпоинт через /settings."
-                        )
-                        return
-                    
-                    endpoint = await get_endpoint(session, user.active_endpoint_id)
-                    if not endpoint:
-                        await first_message.reply(
-                            "❌ Активный эндпоинт не найден. Настройте через /settings"
-                        )
-                        return
-                    
-                    chat_session.endpoint_id = user.active_endpoint_id
-                    await session.flush()
+                    await first_message.reply(
+                        "❌ Endpoint этого топика удалён или недоступен. "
+                        "История сохранена, но продолжить эту сессию нельзя."
+                    )
+                    return
             else:
                 if not user.active_endpoint_id:
                     await first_message.reply(
                         "⚠️ Сначала настройте эндпоинт через /settings в личке с ботом."
                     )
                     return
-                endpoint = await get_endpoint(session, user.active_endpoint_id)
+                endpoint = await get_owned_endpoint(
+                    session, user.telegram_id, user.active_endpoint_id
+                )
                 if not endpoint:
                     await first_message.reply(
                         "❌ Активный эндпоинт не найден. Настройте через /settings"
@@ -823,6 +850,375 @@ async def process_message_batch(batch: list[Message], bot: Bot) -> None:
                 await first_message.reply(f"❌ Непредвиденная ошибка: {error_text}")
             except Exception as reply_error:
                 logger.error(f"Не удалось отправить сообщение об ошибке: {reply_error}")
+
+
+def _session_model_text(owned: OwnedChatSession, *, section: str = "") -> str:
+    """Формирует HTML-карточку модели сессии без чувствительных данных endpoint."""
+    if owned.endpoint is None:
+        raise ValueError("Endpoint сессии удалён или недоступен")
+    current_model = owned.chat_session.model_name or owned.chat_session.model
+    suffix = f"\n\n{section}" if section else ""
+    return (
+        "🤖 <b>Модель текущего топика</b>\n\n"
+        f"<b>Endpoint:</b> {escape_html(owned.endpoint.name)}\n"
+        f"<b>Текущая модель:</b> <code>{escape_html(current_model)}</code>"
+        f"{suffix}"
+    )
+
+
+async def _load_callback_session(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    session_id: int,
+) -> OwnedChatSession | None:
+    """Строго связывает callback с владельцем, чатом и forum topic сообщения."""
+    message = callback.message
+    chat = getattr(message, "chat", None)
+    thread_id = getattr(message, "message_thread_id", None)
+    if message is None or chat is None or thread_id is None:
+        await callback.answer("❌ Меню недоступно вне топика", show_alert=True)
+        return None
+
+    owned = await get_owned_chat_session(
+        session,
+        session_id=session_id,
+        user_id=callback.from_user.id,
+        chat_id=chat.id,
+        message_thread_id=thread_id,
+    )
+    if owned is None:
+        await callback.answer("❌ Сессия не найдена или доступ запрещён", show_alert=True)
+        return None
+    if owned.endpoint is None:
+        await callback.answer(
+            "❌ Endpoint этой сессии удалён или недоступен", show_alert=True
+        )
+        return None
+    return owned
+
+
+async def _available_session_models(
+    session: AsyncSession, owned: OwnedChatSession
+) -> list[str]:
+    """Заново получает модели owner-scoped endpoint и убирает дубликаты."""
+    if owned.endpoint is None:
+        raise ValueError("Endpoint сессии удалён или недоступен")
+    models = await get_models_for_owned_endpoint(
+        session,
+        owned.chat_session.user_id,
+        owned.endpoint.id,
+    )
+    return list(dict.fromkeys(models))
+
+
+async def _show_session_favorites(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    owned: OwnedChatSession,
+) -> None:
+    models = await _available_session_models(session, owned)
+    available = set(models)
+    favorites = await get_favorite_models(session, callback.from_user.id)
+    favorite_names = [
+        favorite.model_name
+        for favorite in favorites
+        if favorite.endpoint_id == owned.endpoint.id
+        and favorite.model_name in available
+    ]
+    current_model = owned.chat_session.model_name or owned.chat_session.model
+    section = (
+        "⭐ <b>Избранные модели этого endpoint:</b>"
+        if favorite_names
+        else "⭐ Избранных доступных моделей для этого endpoint нет."
+    )
+    await callback.message.edit_text(
+        _session_model_text(owned, section=section),
+        reply_markup=session_favorite_models_keyboard(
+            owned.chat_session.id,
+            favorite_names,
+            current_model,
+        ),
+        parse_mode="HTML",
+    )
+
+
+@router.message(
+    Command("model"),
+    F.chat.type.in_({"supergroup", "group"}),
+    F.message_thread_id,
+)
+async def cmd_session_model(message: Message, session: AsyncSession) -> None:
+    """Показывает выбор модели только для уже существующей сессии forum topic."""
+    if message.from_user is None or message.message_thread_id is None:
+        return
+    owned = await get_owned_chat_session_by_topic(
+        session,
+        user_id=message.from_user.id,
+        chat_id=message.chat.id,
+        message_thread_id=message.message_thread_id,
+    )
+    if owned is None:
+        await message.answer(
+            "❌ Для этого топика нет доступной сессии. Сначала отправьте обычное сообщение."
+        )
+        return
+    if owned.endpoint is None:
+        await message.answer(
+            "❌ Endpoint этой сессии удалён или недоступен. История топика сохранена."
+        )
+        return
+
+    try:
+        models = await _available_session_models(session, owned)
+        available = set(models)
+        favorites = await get_favorite_models(session, message.from_user.id)
+        favorite_names = [
+            favorite.model_name
+            for favorite in favorites
+            if favorite.endpoint_id == owned.endpoint.id
+            and favorite.model_name in available
+        ]
+    except Exception as error:
+        logger.warning(
+            "Не удалось получить модели endpoint %s для /model: %s",
+            owned.endpoint.id,
+            error,
+        )
+        await message.answer("❌ Не удалось получить актуальный список моделей endpoint.")
+        return
+
+    current_model = owned.chat_session.model_name or owned.chat_session.model
+    section = (
+        "⭐ <b>Избранные модели этого endpoint:</b>"
+        if favorite_names
+        else "⭐ Избранных доступных моделей для этого endpoint нет."
+    )
+    await message.answer(
+        _session_model_text(owned, section=section),
+        reply_markup=session_favorite_models_keyboard(
+            owned.chat_session.id,
+            favorite_names,
+            current_model,
+        ),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.regexp(r"^sm:m:[0-9]+$"))
+async def callback_session_model_menu(
+    callback: CallbackQuery, session: AsyncSession
+) -> None:
+    try:
+        session_id = int(callback.data.split(":")[2])
+    except (AttributeError, IndexError, ValueError):
+        await callback.answer("❌ Некорректное меню", show_alert=True)
+        return
+    owned = await _load_callback_session(callback, session, session_id)
+    if owned is None:
+        return
+    await callback.message.edit_text(
+        _session_model_text(owned),
+        reply_markup=session_model_menu_keyboard(session_id),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^sm:f:[0-9]+$"))
+async def callback_session_model_favorites(
+    callback: CallbackQuery, session: AsyncSession
+) -> None:
+    try:
+        session_id = int(callback.data.split(":")[2])
+    except (AttributeError, IndexError, ValueError):
+        await callback.answer("❌ Некорректное меню", show_alert=True)
+        return
+    owned = await _load_callback_session(callback, session, session_id)
+    if owned is None:
+        return
+    try:
+        await _show_session_favorites(callback, session, owned)
+    except Exception as error:
+        logger.warning("Не удалось показать избранные модели сессии %s: %s", session_id, error)
+        await callback.answer("❌ Не удалось обновить список моделей", show_alert=True)
+        return
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^sm:l:[0-9]+:-?[0-9]+$"))
+async def callback_session_models_list(
+    callback: CallbackQuery, session: AsyncSession
+) -> None:
+    try:
+        _, _, session_raw, page_raw = callback.data.split(":")
+        session_id = int(session_raw)
+        page = int(page_raw)
+        if page < 0:
+            raise ValueError
+    except (AttributeError, ValueError):
+        await callback.answer("❌ Некорректная страница", show_alert=True)
+        return
+    owned = await _load_callback_session(callback, session, session_id)
+    if owned is None:
+        return
+    try:
+        models = await _available_session_models(session, owned)
+    except Exception as error:
+        logger.warning("Не удалось получить модели сессии %s: %s", session_id, error)
+        await callback.answer("❌ Не удалось обновить список моделей", show_alert=True)
+        return
+    if not models:
+        await callback.answer("❌ Endpoint не вернул доступных моделей", show_alert=True)
+        return
+    max_page = (len(models) - 1) // 8
+    if page > max_page:
+        await callback.answer("❌ Эта страница больше недоступна", show_alert=True)
+        return
+    current_model = owned.chat_session.model_name or owned.chat_session.model
+    await callback.message.edit_text(
+        _session_model_text(
+            owned,
+            section=f"📋 <b>Все модели:</b> страница {page + 1}/{max_page + 1}",
+        ),
+        reply_markup=session_models_list_keyboard(
+            session_id, models, current_model, page=page
+        ),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^sm:s:[0-9]+:[0-9a-f]{12}:-?[0-9]+$"))
+async def callback_session_model_select(
+    callback: CallbackQuery, session: AsyncSession
+) -> None:
+    try:
+        _, _, session_raw, digest, page_raw = callback.data.split(":")
+        session_id = int(session_raw)
+        page = int(page_raw)
+        if page < 0 or len(digest) != 12:
+            raise ValueError
+    except (AttributeError, ValueError):
+        await callback.answer("❌ Некорректный выбор", show_alert=True)
+        return
+    owned = await _load_callback_session(callback, session, session_id)
+    if owned is None:
+        return
+    try:
+        models = await _available_session_models(session, owned)
+    except Exception as error:
+        logger.warning("Не удалось разрешить модель сессии %s: %s", session_id, error)
+        await callback.answer("❌ Не удалось обновить список моделей", show_alert=True)
+        return
+
+    matches = [model for model in models if session_model_digest(model) == digest]
+    if len(matches) != 1:
+        logger.warning(
+            "Digest модели не разрешён однозначно для сессии %s: digest=%s, matches=%s",
+            session_id,
+            digest,
+            len(matches),
+        )
+        await callback.answer(
+            "❌ Модель исчезла или идентификатор неоднозначен. Обновите список.",
+            show_alert=True,
+        )
+        return
+
+    new_model = matches[0]
+    old_model = owned.chat_session.model_name or owned.chat_session.model
+    if new_model == old_model:
+        await callback.answer("ℹ️ Эта модель уже выбрана для топика", show_alert=True)
+        return
+
+    updated = await update_owned_chat_session_model(
+        session,
+        session_id=session_id,
+        user_id=callback.from_user.id,
+        chat_id=callback.message.chat.id,
+        message_thread_id=callback.message.message_thread_id,
+        endpoint_id=owned.endpoint.id,
+        model_name=new_model,
+    )
+    if not updated:
+        await session.rollback()
+        await callback.answer("❌ Сессия изменилась, повторите выбор", show_alert=True)
+        return
+    await session.commit()
+    logger.info(
+        "Пользователь %s сменил модель сессии %s: %s -> %s",
+        callback.from_user.id,
+        session_id,
+        old_model,
+        new_model,
+    )
+    try:
+        await callback.message.edit_text(
+            "✅ <b>Модель текущего топика изменена</b>\n\n"
+            f"<code>{escape_html(old_model)}</code> → <code>{escape_html(new_model)}</code>\n\n"
+            "История диалога сохранена. Новая модель применяется к следующим запросам.",
+            reply_markup=session_model_menu_keyboard(session_id),
+            parse_mode="HTML",
+        )
+    except TelegramBadRequest as error:
+        if "message is not modified" not in str(error).lower():
+            logger.warning(
+                "Модель сессии %s сохранена, но Telegram UI не обновлён: %s",
+                session_id,
+                error,
+            )
+            await callback.answer(
+                "✅ Модель сохранена, но меню не удалось обновить", show_alert=True
+            )
+            return
+    except Exception as error:
+        logger.warning(
+            "Модель сессии %s сохранена, но Telegram UI недоступен: %s",
+            session_id,
+            error,
+        )
+        try:
+            await callback.answer(
+                "✅ Модель сохранена, но меню не удалось обновить", show_alert=True
+            )
+        except Exception:
+            pass
+        return
+    await callback.answer("✅ Модель изменена")
+
+
+@router.callback_query(F.data.regexp(r"^sm:n:[0-9]+$"))
+async def callback_session_model_noop(
+    callback: CallbackQuery, session: AsyncSession
+) -> None:
+    try:
+        session_id = int(callback.data.split(":")[2])
+    except (AttributeError, IndexError, ValueError):
+        await callback.answer("❌ Некорректное меню", show_alert=True)
+        return
+    owned = await _load_callback_session(callback, session, session_id)
+    if owned is None:
+        return
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^sm:x:[0-9]+$"))
+async def callback_session_model_close(
+    callback: CallbackQuery, session: AsyncSession
+) -> None:
+    try:
+        session_id = int(callback.data.split(":")[2])
+    except (AttributeError, IndexError, ValueError):
+        await callback.answer("❌ Некорректное меню", show_alert=True)
+        return
+    owned = await _load_callback_session(callback, session, session_id)
+    if owned is None:
+        return
+    try:
+        await callback.message.delete()
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
 
 
 @router.message(F.chat.type.in_({"supergroup", "group"}), F.message_thread_id)

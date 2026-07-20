@@ -70,17 +70,21 @@ async def get_user_endpoints(session: AsyncSession, user_id: int) -> list[Endpoi
 
 
 async def get_endpoint(session: AsyncSession, endpoint_id: int) -> Endpoint | None:
-    """
-    Возвращает эндпоинт по ID.
-
-    Args:
-        session: Сессия БД
-        endpoint_id: ID эндпоинта
-
-    Returns:
-        Объект Endpoint или None, если не найден
-    """
+    """Возвращает endpoint по ID без проверки владельца (только для trusted-кода)."""
     result = await session.execute(select(Endpoint).where(Endpoint.id == endpoint_id))
+    return result.scalar_one_or_none()
+
+
+async def get_owned_endpoint(
+    session: AsyncSession, user_id: int, endpoint_id: int
+) -> Endpoint | None:
+    """Возвращает endpoint, только если он принадлежит указанному пользователю."""
+    result = await session.execute(
+        select(Endpoint).where(
+            Endpoint.id == endpoint_id,
+            Endpoint.user_id == user_id,
+        )
+    )
     return result.scalar_one_or_none()
 
 
@@ -182,6 +186,35 @@ async def validate_endpoint(base_url: str, api_key: str) -> tuple[bool, str, lis
         msg = f"Неизвестная ошибка: {str(e)}"
         logger.error(f"Неожиданная ошибка при валидации {base_url}: {e}", exc_info=True)
         return False, msg, []
+
+
+async def get_models_for_owned_endpoint(
+    session: AsyncSession, user_id: int, endpoint_id: int
+) -> list[str]:
+    """Получает модели endpoint после обязательной проверки владельца."""
+    endpoint = await get_owned_endpoint(session, user_id, endpoint_id)
+    if endpoint is None:
+        raise ValueError("Эндпоинт не найден или недоступен")
+
+    api_key = decrypt(endpoint.api_key_encrypted)
+    models = await fetch_available_models(endpoint.base_url, api_key, timeout=30)
+    # Ответ endpoint недоверенный: в callback и String(255) допускаем только
+    # непустые строковые идентификаторы, которые можно безопасно сохранить.
+    model_ids = [
+        model_id
+        for model in models
+        if isinstance(model, dict)
+        and isinstance((model_id := model.get("id")), str)
+        and model_id
+        and len(model_id) <= 255
+    ]
+    logger.info(
+        "Для endpoint %s пользователя %s получено %s моделей",
+        endpoint_id,
+        user_id,
+        len(model_ids),
+    )
+    return model_ids
 
 
 async def get_models_for_endpoint(session: AsyncSession, endpoint_id: int) -> list[str]:

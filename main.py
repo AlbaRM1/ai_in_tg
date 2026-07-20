@@ -49,6 +49,7 @@ async def on_startup(bot: Bot) -> None:
     commands = [
         BotCommand(command="start", description="Регистрация с токеном"),
         BotCommand(command="settings", description="Настройка эндпоинтов и моделей"),
+        BotCommand(command="model", description="Модель текущего форум-топика"),
         BotCommand(command="generate_token", description="Генерация токена (только админ)"),
     ]
     await bot.set_my_commands(commands)

@@ -3,6 +3,8 @@
 Создание клавиатур для навигации по меню эндпоинтов, моделей и избранного.
 """
 
+import hashlib
+
 from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -210,6 +212,89 @@ def favorites_keyboard(favorites: list) -> InlineKeyboardMarkup:
     # По 1 кнопке в ряд
     builder.adjust(1)
     
+    return builder.as_markup()
+
+
+def session_model_digest(model_name: str) -> str:
+    """Возвращает короткий стабильный digest полного имени модели для callback_data."""
+    return hashlib.blake2s(model_name.encode("utf-8"), digest_size=6).hexdigest()
+
+
+def session_model_menu_keyboard(session_id: int) -> InlineKeyboardMarkup:
+    """Главное меню выбора модели конкретной сессии."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⭐ Избранные", callback_data=f"sm:f:{session_id}")
+    builder.button(text="📋 Все модели", callback_data=f"sm:l:{session_id}:0")
+    builder.button(text="❌ Закрыть", callback_data=f"sm:x:{session_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def session_favorite_models_keyboard(
+    session_id: int,
+    models: list[str],
+    current_model: str,
+) -> InlineKeyboardMarkup:
+    """Список избранных моделей текущего endpoint сессии."""
+    builder = InlineKeyboardBuilder()
+    for model_name in models:
+        display_name = model_name if len(model_name) <= 40 else model_name[:37] + "..."
+        prefix = "✅ " if model_name == current_model else "⭐ "
+        builder.button(
+            text=f"{prefix}{display_name}",
+            callback_data=(
+                f"sm:s:{session_id}:{session_model_digest(model_name)}:0"
+            ),
+        )
+    builder.button(text="📋 Все модели", callback_data=f"sm:l:{session_id}:0")
+    builder.button(text="⬅️ Назад", callback_data=f"sm:m:{session_id}")
+    builder.button(text="❌ Закрыть", callback_data=f"sm:x:{session_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def session_models_list_keyboard(
+    session_id: int,
+    models: list[str],
+    current_model: str,
+    page: int = 0,
+    page_size: int = 8,
+) -> InlineKeyboardMarkup:
+    """Пагинированный список моделей текущего endpoint сессии."""
+    builder = InlineKeyboardBuilder()
+    total_pages = max(1, (len(models) + page_size - 1) // page_size)
+    page = min(max(page, 0), total_pages - 1)
+    page_models = models[page * page_size:(page + 1) * page_size]
+
+    for model_name in page_models:
+        display_name = model_name if len(model_name) <= 40 else model_name[:37] + "..."
+        prefix = "✅ " if model_name == current_model else ""
+        builder.button(
+            text=f"{prefix}{display_name}",
+            callback_data=(
+                f"sm:s:{session_id}:{session_model_digest(model_name)}:{page}"
+            ),
+        )
+
+    nav_count = 0
+    if total_pages > 1:
+        if page > 0:
+            builder.button(text="⬅️", callback_data=f"sm:l:{session_id}:{page - 1}")
+            nav_count += 1
+        builder.button(text=f"{page + 1}/{total_pages}", callback_data=f"sm:n:{session_id}")
+        nav_count += 1
+        if page < total_pages - 1:
+            builder.button(text="➡️", callback_data=f"sm:l:{session_id}:{page + 1}")
+            nav_count += 1
+
+    builder.button(text="⭐ Избранные", callback_data=f"sm:f:{session_id}")
+    builder.button(text="⬅️ В меню", callback_data=f"sm:m:{session_id}")
+    builder.button(text="❌ Закрыть", callback_data=f"sm:x:{session_id}")
+    pattern = [1] * len(page_models)
+    if nav_count:
+        pattern.append(nav_count)
+    pattern.extend([1, 1, 1])
+    builder.adjust(*pattern)
     return builder.as_markup()
 
 

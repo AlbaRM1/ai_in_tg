@@ -34,6 +34,11 @@ WEB_SEARCH_SYSTEM_INSTRUCTION = (
 )
 
 
+def get_chat_session_model(chat_session: ChatSession) -> str:
+    """Возвращает актуальную модель сессии с fallback на deprecated-поле."""
+    return chat_session.model_name or chat_session.model
+
+
 def build_system_prompt(base_prompt: str | None) -> str:
     """
     Формирует итоговый системный промпт для отправки в LLM.
@@ -200,7 +205,7 @@ async def load_session_history(
     # Модель для токенизатора: предпочитаем зафиксированное model_name, иначе
     # deprecated-поле model. Реальное имя может быть неизвестно litellm — тогда
     # count_tokens автоматически уйдёт в консервативный fallback.
-    token_model = getattr(chat_session, "model_name", None) or chat_session.model
+    token_model = get_chat_session_model(chat_session)
 
     # Загружаем только несжатые сообщения (compressed=False).
     # Сжатые сообщения заменены резюме (is_summary=True), которые загружаем.
@@ -291,7 +296,7 @@ async def llm_compress_history(
     ]
 
     # Создаём временный LLM-сервис для запроса сжатия (модель пользователя)
-    model_name = getattr(chat_session, "model_name", None) or chat_session.model
+    model_name = get_chat_session_model(chat_session)
     llm_service = LLMService(base_url=base_url, api_key=api_key)
 
     logger.info(
@@ -413,7 +418,7 @@ async def compress_history(
         Сжатая история
     """
     # Модель для токенизатора (см. load_session_history): предпочитаем model_name.
-    token_model = getattr(chat_session, "model_name", None) or chat_session.model
+    token_model = get_chat_session_model(chat_session)
 
     # Сохраняем system prompt
     system_prompt = None
@@ -436,11 +441,13 @@ async def compress_history(
 
     if should_try_llm_compression:
         try:
-            # Получаем эндпоинт пользователя для сжатия
-            from app.services.endpoint_service import get_endpoint
+            # Получаем endpoint только после проверки владельца сессии.
+            from app.services.endpoint_service import get_owned_endpoint
             from app.utils.crypto import decrypt
 
-            endpoint = await get_endpoint(session, chat_session.endpoint_id)
+            endpoint = await get_owned_endpoint(
+                session, chat_session.user_id, chat_session.endpoint_id
+            )
             if endpoint:
                 api_key = decrypt(endpoint.api_key_encrypted)
                 
@@ -617,7 +624,8 @@ async def add_message_to_session(
     Returns:
         Созданное сообщение
     """
-    # Подсчитываем токены для этого сообщения
+    # Подсчитываем токены для этого сообщения выбранной моделью сессии.
+    token_model = get_chat_session_model(chat_session)
     try:
         if content_parts:
             # Для мультимодального контента: считаем токены по parts
@@ -628,7 +636,7 @@ async def add_message_to_session(
             if text_parts:
                 text_content = " ".join(text_parts)
                 token_count += count_tokens(
-                    chat_session.model,
+                    token_model,
                     [{"role": role, "content": text_content}],
                 )
             
@@ -643,7 +651,7 @@ async def add_message_to_session(
         else:
             # Обычное текстовое сообщение
             token_count = count_tokens(
-                chat_session.model,
+                token_model,
                 [{"role": role, "content": content}],
             )
     except Exception as e:
@@ -695,7 +703,7 @@ async def ensure_context_fits(
 
     # Эффективный лимит с резервом под ответ модели.
     effective_limit = _effective_context_limit(max_tokens)
-    token_model = getattr(chat_session, "model_name", None) or chat_session.model
+    token_model = get_chat_session_model(chat_session)
 
     # Загружаем текущую историю (уже обрезанную под effective_limit)
     history = await load_session_history(
